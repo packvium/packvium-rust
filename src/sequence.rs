@@ -234,6 +234,19 @@ fn swept_volume(
         .ok_or_else(|| SequenceError::InvalidDirection(direction.to_owned()))
 }
 
+type SweptVolume = (i64, i64, i64, i64, i64, i64);
+
+/// Whether `other` lies in the volume a box sweeps on its way out.
+fn swept_hits(swept: SweptVolume, other: Aabb) -> bool {
+    let (x1, y1, z1, x2, y2, z2) = swept;
+    x1 < other.x2()
+        && other.origin.x < x2
+        && y1 < other.y2()
+        && other.origin.y < y2
+        && z1 < other.z2()
+        && other.origin.z < z2
+}
+
 fn clear_direction(
     index: usize,
     boxes: &[Aabb],
@@ -241,24 +254,14 @@ fn clear_direction(
     container: Dimensions,
     directions: &[&str],
 ) -> Result<Option<String>, SequenceError> {
-    'directions: for direction in directions {
-        let (x1, y1, z1, x2, y2, z2) = swept_volume(boxes[index], container, direction)?;
-        for other_index in present {
-            if *other_index == index {
-                continue;
-            }
-            let other = boxes[*other_index];
-            if x1 < other.x2()
-                && other.origin.x < x2
-                && y1 < other.y2()
-                && other.origin.y < y2
-                && z1 < other.z2()
-                && other.origin.z < z2
-            {
-                continue 'directions;
-            }
+    for direction in directions {
+        let swept = swept_volume(boxes[index], container, direction)?;
+        if present
+            .iter()
+            .all(|other| *other == index || !swept_hits(swept, boxes[*other]))
+        {
+            return Ok(Some((*direction).to_owned()));
         }
-        return Ok(Some((*direction).to_owned()));
     }
     Ok(None)
 }
@@ -270,22 +273,11 @@ fn blocking_indices(
     container: Dimensions,
     direction: &str,
 ) -> Result<BTreeSet<usize>, SequenceError> {
-    let (x1, y1, z1, x2, y2, z2) = swept_volume(boxes[index], container, direction)?;
+    let swept = swept_volume(boxes[index], container, direction)?;
     Ok(present
         .iter()
         .copied()
-        .filter(|other_index| {
-            if *other_index == index {
-                return false;
-            }
-            let other = boxes[*other_index];
-            x1 < other.x2()
-                && other.origin.x < x2
-                && y1 < other.y2()
-                && other.origin.y < y2
-                && z1 < other.z2()
-                && other.origin.z < z2
-        })
+        .filter(|other| *other != index && swept_hits(swept, boxes[*other]))
         .collect())
 }
 
@@ -336,32 +328,152 @@ fn validate_permutation(boxes: &[Aabb], order: &[usize]) -> Result<(), SequenceE
     Ok(())
 }
 
+/// What the removal search knows about one box's way out.
+enum Exits {
+    /// Never reached by the scan.
+    Untested,
+    /// Found blocked once, by the same early-exit test a full rescan would run.
+    Blocked,
+    /// Found blocked twice: the swept volume and present blocker count of each direction,
+    /// lowered as boxes leave so the box is not tested against the scene again.
+    Counted(Vec<(SweptVolume, usize)>),
+    /// Some exit is clear. Clearance only improves as boxes leave, so this stays true.
+    Clear,
+}
+
+/// The lowest-index-first removal search. It answers exactly what a rescan from index 0
+/// after every removal would, but a box that is blocked a second time gets per-direction
+/// blocker counts that each removal lowers, so it is never tested against the whole scene
+/// again. A scene whose first box is usually removable never pays for counts at all.
+///
+/// Worst case `O(n^2 * d)` time for `n` boxes and `d` directions: each box is tested once
+/// by the early-exit scan, counted once in `O(n * d)`, then costs `O(d)` per removal.
+struct RemovalSearch<'a> {
+    boxes: &'a [Aabb],
+    container: Dimensions,
+    directions: &'a [&'a str],
+    present: BTreeSet<usize>,
+    /// Present boxes still resting on each box.
+    resting_on_top: Vec<usize>,
+    /// The boxes each box rests on, which lose one rider when it is removed.
+    supporters: Vec<Vec<usize>>,
+    exits: Vec<Exits>,
+}
+
+impl<'a> RemovalSearch<'a> {
+    fn new(boxes: &'a [Aabb], container: Dimensions, directions: &'a [&'a str]) -> Self {
+        let graph = UnloadingDependencyGraph::build(boxes);
+        let mut supporters = vec![Vec::new(); boxes.len()];
+        for (lower, riders) in graph.depends_on.iter().enumerate() {
+            for rider in riders {
+                supporters[*rider].push(lower);
+            }
+        }
+        Self {
+            boxes,
+            container,
+            directions,
+            present: (0..boxes.len()).collect(),
+            resting_on_top: graph.depends_on.iter().map(BTreeSet::len).collect(),
+            supporters,
+            exits: (0..boxes.len()).map(|_| Exits::Untested).collect(),
+        }
+    }
+
+    fn count_blockers(&self, index: usize) -> Result<Vec<(SweptVolume, usize)>, SequenceError> {
+        self.directions
+            .iter()
+            .map(|direction| {
+                let swept = swept_volume(self.boxes[index], self.container, direction)?;
+                let blockers = self
+                    .present
+                    .iter()
+                    .filter(|other| **other != index && swept_hits(swept, self.boxes[**other]))
+                    .count();
+                Ok((swept, blockers))
+            })
+            .collect()
+    }
+
+    fn is_removable(&mut self, index: usize) -> Result<bool, SequenceError> {
+        if self.resting_on_top[index] != 0 {
+            return Ok(false);
+        }
+        let exits = std::mem::replace(&mut self.exits[index], Exits::Untested);
+        let (exits, removable) = match exits {
+            Exits::Clear => (Exits::Clear, true),
+            Exits::Untested => {
+                let clear = clear_direction(
+                    index,
+                    self.boxes,
+                    &self.present,
+                    self.container,
+                    self.directions,
+                )?
+                .is_some();
+                (if clear { Exits::Clear } else { Exits::Blocked }, clear)
+            }
+            Exits::Blocked => {
+                let counted = self.count_blockers(index)?;
+                Self::settle(counted)
+            }
+            Exits::Counted(counted) => Self::settle(counted),
+        };
+        self.exits[index] = exits;
+        Ok(removable)
+    }
+
+    fn settle(counted: Vec<(SweptVolume, usize)>) -> (Exits, bool) {
+        if counted.iter().any(|(_, blockers)| *blockers == 0) {
+            (Exits::Clear, true)
+        } else {
+            (Exits::Counted(counted), false)
+        }
+    }
+
+    /// The lowest-index present box with nothing on it and a clear way out.
+    fn next(&mut self) -> Result<Option<usize>, SequenceError> {
+        for index in 0..self.boxes.len() {
+            if self.present.contains(&index) && self.is_removable(index)? {
+                return Ok(Some(index));
+            }
+        }
+        Ok(None)
+    }
+
+    fn remove(&mut self, removed: usize) {
+        self.present.remove(&removed);
+        for exits in &mut self.exits {
+            if let Exits::Counted(counted) = exits {
+                for (swept, blockers) in counted {
+                    if swept_hits(*swept, self.boxes[removed]) {
+                        *blockers -= 1;
+                    }
+                }
+            }
+        }
+        for lower in std::mem::take(&mut self.supporters[removed]) {
+            self.resting_on_top[lower] -= 1;
+        }
+    }
+}
+
 pub fn safe_removal_order(
     boxes: &[Aabb],
     container: Dimensions,
     directions: &[&str],
 ) -> Result<Vec<usize>, SequenceError> {
     validate_directions(directions)?;
-    let graph = UnloadingDependencyGraph::build(boxes);
-    let mut present = (0..boxes.len()).collect::<BTreeSet<_>>();
+    let mut search = RemovalSearch::new(boxes, container, directions);
     let mut order = Vec::with_capacity(boxes.len());
-    while !present.is_empty() {
-        let mut chosen = None;
-        for index in &present {
-            if graph.depends_on[*index].is_disjoint(&present)
-                && clear_direction(*index, boxes, &present, container, directions)?.is_some()
-            {
-                chosen = Some(*index);
-                break;
-            }
-        }
-        let Some(index) = chosen else {
-            return Err(SequenceError::Stuck {
-                stuck: present.into_iter().collect(),
-            });
-        };
+    while let Some(index) = search.next()? {
         order.push(index);
-        present.remove(&index);
+        search.remove(index);
+    }
+    if !search.present.is_empty() {
+        return Err(SequenceError::Stuck {
+            stuck: search.present.into_iter().collect(),
+        });
     }
     replay_removal_order(boxes, container, &order, directions)?;
     Ok(order)
@@ -722,6 +834,84 @@ mod tests {
         }
     }
 
+    /// The search as it was before the blocking counts: restart at the lowest index after
+    /// every removal and test each box again. Kept as the oracle for `RemovalSearch`.
+    fn rescanning_removal_order(
+        boxes: &[Aabb],
+        container: Dimensions,
+        directions: &[&str],
+    ) -> Result<Vec<usize>, SequenceError> {
+        validate_directions(directions)?;
+        let graph = UnloadingDependencyGraph::build(boxes);
+        let mut present = (0..boxes.len()).collect::<BTreeSet<_>>();
+        let mut order = Vec::with_capacity(boxes.len());
+        while !present.is_empty() {
+            let mut chosen = None;
+            for index in &present {
+                if graph.depends_on[*index].is_disjoint(&present)
+                    && clear_direction(*index, boxes, &present, container, directions)?.is_some()
+                {
+                    chosen = Some(*index);
+                    break;
+                }
+            }
+            let Some(index) = chosen else {
+                return Err(SequenceError::Stuck {
+                    stuck: present.into_iter().collect(),
+                });
+            };
+            order.push(index);
+            present.remove(&index);
+        }
+        replay_removal_order(boxes, container, &order, directions)?;
+        Ok(order)
+    }
+
+    #[test]
+    fn counted_removal_search_matches_the_rescanning_search_on_mixed_scenes() {
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = |bound: i64| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((state >> 33) as i64) % bound
+        };
+        let direction_sets: [&[&str]; 5] =
+            [&["+x"], &["+x", "+y"], &["-z", "+x"], &ALL_DIRECTIONS, &[]];
+        for round in 0..400 {
+            let count = 1 + next(14) as usize;
+            let boxes: Vec<Aabb> = (0..count)
+                .map(|_| {
+                    box_at(
+                        next(5) * 10,
+                        next(4) * 10,
+                        next(3) * 10,
+                        10 * (1 + next(2)),
+                        10 * (1 + next(2)),
+                        10,
+                    )
+                })
+                .collect();
+            let container = dimensions(60, 50, 40);
+            let directions = direction_sets[round % direction_sets.len()];
+            assert_eq!(
+                safe_removal_order(&boxes, container, directions),
+                rescanning_removal_order(&boxes, container, directions),
+                "round {round}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_row_blocked_all_the_way_back_unloads_nearest_the_door_first() {
+        let boxes: Vec<Aabb> = (0..60).map(|i| box_at(i * 10, 0, 0, 10, 10, 10)).collect();
+        let container = dimensions(600, 10, 10);
+        assert_eq!(
+            safe_removal_order(&boxes, container, &["+x"]).unwrap(),
+            (0..60).rev().collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn stack_has_distinct_loading_and_unloading_orders() {
         let boxes = [box_at(0, 0, 0, 10, 10, 10), box_at(0, 0, 10, 10, 10, 10)];
@@ -1049,6 +1239,7 @@ mod tests {
             made_to_measure: None,
             pallet_overhang_limit: None,
             deck: None,
+            upright_frame: false,
         }
     }
 

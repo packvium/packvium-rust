@@ -1,9 +1,14 @@
 use std::rc::Rc;
 
+// Re-exported so the solvers and the old paths keep working; the code lives below them (R-02).
+pub(crate) use crate::billing::{
+    billed_dimensional_weight, dimensional_weight_ticks, unpriceable_container,
+};
 use crate::contact_graph::{ContactEdge, ContactGraph};
 use crate::deadline::Deadline;
 use crate::geometry::{self, Aabb, Dimensions, Point, Rotation, ShapeType};
 use crate::hull::{self, HullShape};
+pub(crate) use crate::loads::{LoadSubject, calculate_top_loads, calculate_top_loads_with_graph};
 use crate::made_to_measure::sides_of;
 use crate::model::*;
 use crate::pallet_overhang::{deck_alone, floor_support, moved};
@@ -580,10 +585,8 @@ pub fn find_candidates_at_points(
             doors,
         )
     });
-    let flat_bag = state.packed.container.is_flat_bag();
-    // W + G is summed once per call, so each candidate's girth check stays O(1) (1.10).
-    let girth_length = state.packed.container.inner_dimensions.length.0;
-    let girth_width = state.packed.container.girth_width_limit();
+    // Both loop limits are summed once per call, so each candidate's girth check stays O(1).
+    let girth = state.packed.container.girth();
     let axle_base = AxleBase::new(&state.packed.container, &state.packed.placements);
     let mut candidates = CandidateAccumulator::new(limit);
     for (point_index, point) in points.into_iter().enumerate() {
@@ -606,16 +609,11 @@ pub fn find_candidates_at_points(
             if !boundary.contains(envelope_box) {
                 continue;
             }
-            // A bag also needs a + c <= L and b + c <= W + G over the running extents grown
-            // by the candidate (G is a gusseted bag's side gusset, 0 for a flat one):
-            // O(1), and the extents only grow, so no verdict flips.
-            if flat_bag
-                && !girth_within(
-                    grown_extent(state.extent, envelope_box),
-                    girth_length,
-                    girth_width,
-                )
-            {
+            // A bag also needs both loops of film round the running extents grown by the
+            // candidate: lying flat 2(a + c) <= 2L + K and b + c <= W + G, standing
+            // 2(b + c) <= 2L + K and a + b <= W + G (1.10,; `Girth`). O(1),
+            // and the extents only grow, so no verdict flips.
+            if girth.is_some_and(|girth| !girth.admits(grown_extent(state.extent, envelope_box))) {
                 continue;
             }
             let clearance = request.config.clearance.0;
@@ -1357,6 +1355,8 @@ fn pack_container_plans(
     metrics: &mut SolverMetrics,
 ) -> (Vec<PackedContainer>, Vec<ItemInstance>) {
     let mut incumbent = initial.clone();
+    // The incumbent's score is read once per plan compared, so it is kept with the plan.
+    let mut incumbent_score = multi_plan_score(&incumbent, &incumbent.remaining, &request.config);
     let mut beam = vec![initial];
     let mut plan_nodes = 0_usize;
     let maximum = request.config.max_containers.unwrap_or(usize::MAX);
@@ -1375,10 +1375,10 @@ fn pack_container_plans(
         let mut exhausted = false;
         for plan in &beam {
             if plan.remaining.is_empty() || plan.packed.len() >= maximum {
-                if multi_plan_score(plan, &plan.remaining, &request.config)
-                    < multi_plan_score(&incumbent, &incumbent.remaining, &request.config)
-                {
+                let score = multi_plan_score(plan, &plan.remaining, &request.config);
+                if score < incumbent_score {
                     incumbent = plan.clone();
+                    incumbent_score = score;
                 }
                 continue;
             }
@@ -1421,10 +1421,10 @@ fn pack_container_plans(
                 child.remaining = remaining;
                 decrement(&mut child.inventory, &container.id);
                 child.packed.push(state.packed);
-                if multi_plan_score(&child, &child.remaining, &request.config)
-                    < multi_plan_score(&incumbent, &incumbent.remaining, &request.config)
-                {
+                let score = multi_plan_score(&child, &child.remaining, &request.config);
+                if score < incumbent_score {
                     incumbent = child.clone();
+                    incumbent_score = score;
                 }
                 expansions.push(child);
             }
@@ -1457,7 +1457,7 @@ fn pack_container_plans(
             }
         }
         beam = dominant.into_values().collect();
-        beam.sort_by_key(|plan| multi_plan_bound(plan, request));
+        beam.sort_by_cached_key(|plan| multi_plan_bound(plan, request));
         beam.truncate(request.config.container_plan_beam_width);
     }
     (incumbent.packed, incumbent.remaining)
@@ -1887,51 +1887,6 @@ fn load_rules_hold<T: LoadSubject>(
     stack_limits_valid(bodies, graph)
         && crush_free(bodies, &loads)
         && stack_density_valid_with_loads(bodies, max_density, &loads)
-}
-
-/// The item facts the bearing rules read about one box, and nothing else. `Placement`
-/// answers from its item; `LoadBody` is the same facts copied or borrowed out once per
-/// sweep, so a candidate check never clones an `Item` -- its id, tags and metadata -- to
-/// read them.
-pub(crate) trait LoadSubject {
-    fn envelope(&self) -> Aabb;
-    fn weight_ticks(&self) -> i64;
-    fn max_top_load_ticks(&self) -> Option<i64>;
-    fn max_stacked_items(&self) -> Option<usize>;
-    fn max_compression_pressure_kpa(&self) -> Option<i64>;
-    /// The item's own footprint, which a load presses on; the envelope is grown by the
-    /// clearance and carries the support graph.
-    fn footprint(&self) -> i128;
-    fn stacking_group(&self) -> Option<&str>;
-    /// The code refusing an item of `upper_group` resting directly on this box.
-    fn stacking_refusal(&self, upper_group: Option<&str>) -> Option<&'static str>;
-}
-
-impl LoadSubject for Placement {
-    fn envelope(&self) -> Aabb {
-        self.envelope_box()
-    }
-    fn footprint(&self) -> i128 {
-        self.dimensions.base_area()
-    }
-    fn weight_ticks(&self) -> i64 {
-        self.instance.item.weight.0
-    }
-    fn max_top_load_ticks(&self) -> Option<i64> {
-        self.instance.item.max_top_load.map(|weight| weight.0)
-    }
-    fn max_stacked_items(&self) -> Option<usize> {
-        self.instance.item.max_stacked_items
-    }
-    fn max_compression_pressure_kpa(&self) -> Option<i64> {
-        self.instance.item.max_compression_pressure_kpa
-    }
-    fn stacking_group(&self) -> Option<&str> {
-        self.instance.item.stacking_group.as_deref()
-    }
-    fn stacking_refusal(&self, upper_group: Option<&str>) -> Option<&'static str> {
-        self.instance.item.stacking_refusal(upper_group)
-    }
 }
 
 /// The stacking facts are borrowed from the placed item rather than copied, so a body
@@ -2766,64 +2721,6 @@ fn crush_free<T: LoadSubject>(bodies: &[T], loads: &[i128]) -> bool {
     })
 }
 
-pub fn calculate_top_loads(placements: &[Placement]) -> Option<Vec<i128>> {
-    let graph = ContactGraph::from_placements(placements);
-    calculate_top_loads_with_graph(placements, &graph)
-}
-
-fn calculate_top_loads_with_graph<T: LoadSubject>(
-    bodies: &[T],
-    graph: &ContactGraph,
-) -> Option<Vec<i128>> {
-    let mut loads = vec![0_i128; bodies.len()];
-    let mut order = (0..bodies.len()).collect::<Vec<_>>();
-    order.sort_by_key(|index| {
-        let envelope = bodies[*index].envelope();
-        Reverse((envelope.z2(), envelope.origin.z))
-    });
-
-    for upper_index in order {
-        let upper = bodies[upper_index].envelope();
-        if upper.origin.z == 0 {
-            continue;
-        }
-        let supports = graph.supporters(upper_index);
-        if supports.is_empty() {
-            continue;
-        }
-        let total_area = supports.iter().map(|edge| edge.area).sum::<i128>();
-        let downward = i128::from(bodies[upper_index].weight_ticks()) + loads[upper_index];
-        let mut distributed = 0_i128;
-        for (position, edge) in supports.iter().enumerate() {
-            let share = if position + 1 == supports.len() {
-                downward.saturating_sub(distributed)
-            } else {
-                downward.saturating_mul(edge.area) / total_area
-            };
-            distributed = distributed.saturating_add(share);
-            let support = &bodies[edge.index];
-            // `stackable: false` is geometry, not load: nothing may rest on the item at
-            // all. Gating it on `share > 0` meant a weightless box resting on a
-            // non-stackable one transferred nothing and so was waved through, and since
-            // nothing here self-validates the answer came back `feasible` while the
-            // shared validator called it `non_stackable`.
-            if support
-                .stacking_refusal(bodies[upper_index].stacking_group())
-                .is_some()
-            {
-                return None;
-            }
-            loads[edge.index] = loads[edge.index].saturating_add(share);
-            if let Some(maximum) = support.max_top_load_ticks()
-                && loads[edge.index] > i128::from(maximum)
-            {
-                return None;
-            }
-        }
-    }
-    Some(loads)
-}
-
 fn inventory(request: &PackingRequest) -> BTreeMap<String, Option<usize>> {
     request
         .containers
@@ -3519,82 +3416,6 @@ fn best_beam_nodes(
 /// vector stays exactly comparable across languages.
 pub(crate) const SCORE_SCALE: i128 = 1_000_000;
 
-pub(crate) fn dimensional_weight_ticks(container: &Container, config: &PackingConfig) -> i128 {
-    // An empty pallet is billed at its declared footprint, never its solving frame.
-    dimensional_weight_of(
-        container
-            .outer_dimensions
-            .unwrap_or_else(|| container.declared_inner()),
-        config,
-    )
-}
-
-/// What a carrier bills by volume for this container as filled: a flat bag's achieved
-/// package (empty: nothing), which only grows as items are added and so also bounds any
-/// completion from below, else the declared outer size. `O(p)` for a bag.
-pub(crate) fn billed_dimensional_weight(packed: &PackedContainer, config: &PackingConfig) -> i128 {
-    dimensional_weight_of(packed.billed_dimensions(), config)
-}
-
-fn dimensional_weight_of(dimensions: Dimensions, config: &PackingConfig) -> i128 {
-    let length_ticks_per_unit = match config.dimensional_weight_length_unit.as_str() {
-        "mm" => Length::TICKS_PER_MM as i128,
-        "cm" => (Length::TICKS_PER_MM * 10) as i128,
-        "m" => (Length::TICKS_PER_MM * 1_000) as i128,
-        "in" => Length::TICKS_PER_INCH as i128,
-        "ft" => (Length::TICKS_PER_INCH * 12) as i128,
-        _ => unreachable!("configuration units are validated at admission"),
-    };
-    let weight_ticks_per_unit = match config.dimensional_weight_weight_unit.as_str() {
-        "mg" => Weight::TICKS_PER_MG as i128,
-        "g" => Weight::TICKS_PER_G as i128,
-        "kg" => Weight::TICKS_PER_KG as i128,
-        "oz" => Weight::TICKS_PER_OZ as i128,
-        "lb" => Weight::TICKS_PER_LB as i128,
-        _ => unreachable!("configuration units are validated at admission"),
-    };
-    dimensions.volume() * weight_ticks_per_unit
-        / (length_ticks_per_unit.pow(3)
-            * config
-                .dimensional_weight_divisor
-                .expect("shipping_cost divisor is validated at admission"))
-}
-
-/// The first container in a finished answer whose own rate table cannot price it, as
-/// `(container id, billed grams, last bracket)`.
-///
-/// Ranking an unpriceable candidate worst is what makes a priceable alternative win the
-/// round; it is a search device, not an answer. This is the guard that keeps the sentinel
-/// from ever surfacing: a returned packing the tariff cannot price would quote a number
-/// the carrier never published, which is the one outcome `charge_minor` refuses to
-/// invent. Callers turn a hit into the same refusal Python and PHP raise.
-pub(crate) fn unpriceable_container(
-    containers: &[PackedContainer],
-    config: &PackingConfig,
-) -> Option<(String, i64, i64)> {
-    if config.objective != "lowest_landed_cost" {
-        return None;
-    }
-    containers.iter().find_map(|packed| {
-        let dimensional = billed_dimensional_weight(packed, config);
-        let billed = i128::from(packed.gross_weight().0).max(dimensional);
-        let grams = RateTable::grams(billed as i64);
-        // A container with no table at all is refused at admission, so `parse_request`
-        // callers never reach this arm -- but `pack_request_with_policy` is public, and a
-        // Rust consumer assembling a `PackingRequest` by hand bypasses that check. Report
-        // it rather than skipping it: an untabled container is the one case where "cannot
-        // price" is certain. Python and PHP report the same `0` bracket here.
-        let Some(table) = packed.container.rate_table.as_ref() else {
-            return Some((packed.container.id.clone(), grams, 0));
-        };
-        if table.charge_minor(grams).is_some() {
-            return None;
-        }
-        let last = table.weight_brackets_g.last().copied().unwrap_or(0);
-        Some((packed.container.id.clone(), grams, last))
-    })
-}
-
 /// How good opening this container type would be, ranked the way the finished result
 /// will be ranked.
 ///
@@ -3654,7 +3475,7 @@ fn container_selection_key(
         container
             .rate_table
             .as_ref()
-            .and_then(|table| table.charge_minor(RateTable::grams(billable as i64)))
+            .and_then(|table| table.charge_minor(RateTable::grams_saturating(billable)))
             .map_or(i128::MAX, i128::from)
     } else {
         0
@@ -3761,7 +3582,7 @@ pub fn score_solution(
                     .container
                     .rate_table
                     .as_ref()
-                    .and_then(|table| table.charge_minor(RateTable::grams(billed as i64)))
+                    .and_then(|table| table.charge_minor(RateTable::grams_saturating(billed)))
                 {
                     Some(charge) => landed.saturating_add(i128::from(charge)),
                     None => i128::MAX,
@@ -4344,6 +4165,7 @@ mod tests {
             made_to_measure: None,
             pallet_overhang_limit: None,
             deck: None,
+            upright_frame: false,
         }
     }
 

@@ -12,9 +12,12 @@
 use super::Issue;
 use super::container::{SCORE_SCALE, ratio_ppm};
 use super::json::{Json, Ordered, Res};
-use super::num::{add, ceil_div, floor_div, mul, py_mod, sub};
+use super::num::{Ratio, add, ceil_div, floor_div, mul, py_mod, sub};
+use super::objective::dimensional_weight;
 use super::pyfmt::{int_list, py_repr};
 use super::spec::{ContainerSpec, ItemSpec};
+use super::units::TICKS_PER_GRAM;
+use std::cmp::Ordering;
 
 const MAX_BOUND_SUM: i128 = 1_000_000_000_000_000_000_000_000_000_000;
 const MAX_BOUND_VALUE: i128 = 9_007_199_254_740_991;
@@ -44,12 +47,14 @@ enum Key {
     ValueForgone,
     AchievedHeight,
     UnpackedVolumePpm,
+    /// What a carrier bills, `shipping_cost`'s and `lowest_landed_cost`'s own key.
+    Billed,
 }
 
 /// Where each covered objective reads its bound in its own score order, with the objective's
 /// name for the withholding reason. Any other objective has no bound.
 fn order_of(objective: &Json) -> Option<(&str, [Key; 5])> {
-    use Key::{AchievedHeight, Bound, UnpackedVolumePpm, ValueForgone};
+    use Key::{AchievedHeight, Billed, Bound, UnpackedVolumePpm, ValueForgone};
     let Json::Str(name) = objective else {
         return None;
     };
@@ -59,6 +64,7 @@ fn order_of(objective: &Json) -> Option<(&str, [Key; 5])> {
         "maximum_value" => [Bound(0), ValueForgone, Bound(1), Bound(2), Bound(3)],
         "open_dimension_height" => [Bound(0), AchievedHeight, Bound(1), Bound(2), Bound(3)],
         "maximum_volume" => [UnpackedVolumePpm, Bound(0), Bound(1), Bound(2), Bound(3)],
+        "shipping_cost" | "lowest_landed_cost" => [Bound(0), Billed, Bound(1), Bound(3), Bound(4)],
         _ => return None,
     };
     Some((name, order))
@@ -394,10 +400,12 @@ fn inputs(items: &Ordered<ItemSpec>, containers: &Ordered<ContainerSpec>) -> Res
     Ok((volumes, weights, shrinks, types))
 }
 
-/// `bound` read in `order`, each objective-only key computed from the same inputs.
+/// `bound` read in `order`, each objective-only key computed from the same inputs and the
+/// billed key, where ranked, already computed as `billed`.
 fn stated_vector(
     order: &[Key; 5],
     bound: &[i128; 5],
+    billed: i128,
     values: &[(i128, i128)],
     volumes: &[(i128, i128)],
     shrinks: bool,
@@ -407,9 +415,225 @@ fn stated_vector(
         .iter()
         .map(|&key| match key {
             Key::Bound(position) => Ok(bound[position]),
+            Key::Billed => Ok(billed),
             _ => objective_term(key, values, volumes, shrinks, containers, bound[0]),
         })
         .collect()
+}
+
+/// The `count` smallest of `{value repeated quantity}`, summed; `None` if fewer exist.
+fn least_of_inventory(mut values: Vec<(i128, Option<i128>)>, mut count: i128) -> Res<Option<i128>> {
+    values.sort_by_key(|pair| pair.0);
+    let mut total = 0;
+    for (value, quantity) in values {
+        if count <= 0 {
+            break;
+        }
+        let taken = quantity.map_or(count, |quantity| quantity.min(count));
+        total = add(total, mul(value, taken)?)?;
+        count -= taken;
+    }
+    Ok((count <= 0).then_some(total))
+}
+
+/// Least cost covering `need` from `(cost, capacity, quantity)` offers taken fractionally,
+/// rounded up; greedy by cost per unit is optimal for one covering constraint.
+fn fractional_cover(offers: &[(i128, i128, Option<i128>)], need: i128) -> Res<Option<i128>> {
+    if need <= 0 {
+        return Ok(Some(0));
+    }
+    let mut ranked = Vec::new();
+    for &(cost, capacity, quantity) in offers.iter().filter(|offer| offer.1 > 0) {
+        ranked.push((Ratio::new(cost, capacity)?, cost, capacity, quantity));
+    }
+    // Stable, as Python's `sorted` is; offers of equal cost per unit keep their order.
+    ranked.sort_by_key(|offer| offer.0);
+    let (mut remaining, mut total) = (Ratio::from_int(need), Ratio::from_int(0));
+    for (_, cost, capacity, quantity) in ranked {
+        let mut share = remaining.mul(Ratio::new(1, capacity)?)?;
+        if let Some(quantity) = quantity
+            && share.compare_int(quantity)? == Ordering::Greater
+        {
+            share = Ratio::from_int(quantity);
+        }
+        total = total.add(share.mul_int(cost)?)?;
+        remaining = remaining.add(share.mul_int(capacity)?.negate()?)?;
+        if remaining.compare_int(0)? != Ordering::Greater {
+            return ceil_div(total.numerator, total.denominator).map(Some);
+        }
+    }
+    Ok(None)
+}
+
+/// The size a container's dimensional weight is billed on: its declared outer size, else its
+/// declared floor and height -- a pallet's deck, not its solving frame.
+fn declared_billed_size(spec: &ContainerSpec) -> [i128; 3] {
+    match (spec.outer, spec.deck) {
+        (Some(outer), _) => outer,
+        (None, Some(deck)) => [deck[2], deck[3], spec.inner[2]],
+        (None, None) => spec.inner,
+    }
+}
+
+/// One container type as the billed key reads it: its tare and its floor
+/// `max(tare, dimensional)` in weight ticks, and, for `lowest_landed_cost`, its rate table as
+/// `(bracket bound in weight ticks, charge in minor units)`, `None` where nothing is priced.
+#[derive(Clone, Debug)]
+struct BilledType {
+    tare: i128,
+    floor: i128,
+    brackets: Vec<(i128, Option<i128>)>,
+}
+
+/// Each type's `BilledType`, read from the request, or `None` without a divisor to bill by.
+///
+/// The floor is the dimensional weight of the declared outer size, else the declared floor
+/// and height, and 0 for a bag, whose billed package can be smaller. A bracket's charge is
+/// `max(price, minimum)` plus the surcharge rounded up, the rate table's own order.
+fn billed_types(
+    configuration: &Json,
+    containers: &Ordered<ContainerSpec>,
+    landed: bool,
+) -> Res<Option<Vec<BilledType>>> {
+    let divisor = configuration.get_null("dimensional_weight_divisor")?;
+    if divisor.is_null() {
+        return Ok(None);
+    }
+    let divisor = divisor.py_int("dimensional_weight_divisor")?;
+    let (inches, pounds) = (Json::str_of("in"), Json::str_of("lb"));
+    let length_unit = configuration
+        .get_or("dimensional_weight_length_unit", &inches)?
+        .text("dimensional_weight_length_unit")?;
+    let weight_unit = configuration
+        .get_or("dimensional_weight_weight_unit", &pounds)?
+        .text("dimensional_weight_weight_unit")?;
+    let mut types = Vec::with_capacity(containers.len());
+    for spec in containers.values() {
+        let dimensional = if spec.flat_bag {
+            0
+        } else {
+            let size = declared_billed_size(spec);
+            dimensional_weight(size, divisor, length_unit, weight_unit)?
+        };
+        types.push(BilledType {
+            tare: spec.tare_weight,
+            floor: spec.tare_weight.max(dimensional),
+            brackets: if landed {
+                rate_brackets(&spec.rate_table)?
+            } else {
+                Vec::new()
+            },
+        });
+    }
+    Ok(Some(types))
+}
+
+/// A rate table's brackets with the charge at each bound; none for an absent table.
+fn rate_brackets(table: &Json) -> Res<Vec<(i128, Option<i128>)>> {
+    if !table.truthy() {
+        return Ok(Vec::new());
+    }
+    let zero = Json::Int(0);
+    let minimum = table
+        .get_or("minimum_charge_minor", &zero)?
+        .py_int("minimum_charge_minor")?;
+    let permille = table
+        .get_or("fuel_surcharge_permille", &zero)?
+        .py_int("fuel_surcharge_permille")?;
+    let brackets = table.at("weight_brackets_g")?.list("weight_brackets_g")?;
+    let prices = table.at("prices_minor")?.list("prices_minor")?;
+    let mut priced = Vec::with_capacity(brackets.len());
+    for (grams, price) in brackets.iter().zip(prices) {
+        let base = price.py_int("price")?.max(minimum);
+        priced.push((
+            mul(grams.py_int("bracket")?, TICKS_PER_GRAM)?,
+            Some(add(base, ceil_div(mul(base, permille)?, 1000)?)?),
+        ));
+    }
+    Ok(priced)
+}
+
+/// The billed key of `shipping_cost` or `lowest_landed_cost`, or `None` when no
+/// priceable inventory carries a packing that leaves exactly `L0` behind.
+///
+/// Each opened container bills at least its floor and at least its tare plus what it
+/// carries. A rate-table bracket is reachable from a floor within it; there a container
+/// carries at most the bracket's bound less its tare (and its `max_payload`), so at most the
+/// lightest-first count under that, its usable volume and `max_items`. The cheapest reachable
+/// charge over the `L1` containers, the cheapest cover of the placed weight and of the placed
+/// count each bound the charge; the largest is stated. `billed` and `types` are one per
+/// container type, in the same order. O(t + c b log(c b)) for `t` runs and `b` brackets per
+/// type.
+fn billed_key(
+    landed: bool,
+    billed: &[BilledType],
+    volumes: &[(i128, i128)],
+    weights: &[(i128, i128)],
+    shrinks: bool,
+    types: &[BoundContainer],
+    bound: &[i128; 5],
+) -> Res<Option<i128>> {
+    let (unpacked, opened) = (bound[0], bound[1]);
+    let placed = run_count(volumes) - unpacked;
+    if !landed {
+        if opened == 0 {
+            return Ok(Some(0));
+        }
+        let quantities = types.iter().map(|container| container.quantity);
+        let floors = billed.iter().map(|b| b.floor).zip(quantities.clone());
+        let tares = billed.iter().map(|b| b.tare).zip(quantities);
+        let (Some(by_floor), Some(by_tare)) = (
+            least_of_inventory(floors.collect(), opened)?,
+            least_of_inventory(tares.collect(), opened)?,
+        ) else {
+            return Ok(None);
+        };
+        return Ok(Some(
+            by_floor.max(add(by_tare, smallest(weights, placed)?)?),
+        ));
+    }
+    if opened == 0 || placed == 0 {
+        return Ok(Some(0));
+    }
+    let (mut cheapest, mut by_weight, mut by_items) = (Vec::new(), Vec::new(), Vec::new());
+    for (billing, container) in billed.iter().zip(types) {
+        let mut charges = Vec::new();
+        for &(limit, charge) in &billing.brackets {
+            let Some(charge) = charge.filter(|_| billing.floor <= limit) else {
+                continue;
+            };
+            let mut carried = sub(limit, billing.tare)?;
+            if let Some(payload) = container.payload {
+                carried = carried.min(payload);
+            }
+            let mut count = fit(weights, Some(carried))?;
+            if !shrinks {
+                count = count.min(fit(volumes, Some(container.usable))?);
+            }
+            if let Some(slots) = container.max_items {
+                count = count.min(slots);
+            }
+            charges.push(charge);
+            by_weight.push((charge, carried, container.quantity));
+            by_items.push((charge, count, container.quantity));
+        }
+        if let Some(least) = charges.iter().min() {
+            cheapest.push((*least, container.quantity));
+        }
+    }
+    let terms = [
+        least_of_inventory(cheapest, opened)?,
+        fractional_cover(&by_weight, smallest(weights, placed)?)?,
+        fractional_cover(&by_items, placed)?,
+    ];
+    let mut key = 0;
+    for term in terms {
+        let Some(term) = term else {
+            return Ok(None);
+        };
+        key = key.max(term);
+    }
+    Ok(Some(key))
 }
 
 /// The bound in the objective's score order, or `None` with the reason none is stated (§ 1.5).
@@ -421,9 +645,8 @@ fn stated(
 ) -> Res<(Option<Vec<i128>>, String)> {
     let empty = Json::Dict(Vec::new());
     let default = Json::str_of("default");
-    let name = request
-        .get_or("configuration", &empty)?
-        .get_or("objective", &default)?;
+    let configuration = request.get_or("configuration", &empty)?;
+    let name = configuration.get_or("objective", &default)?;
     let Some((objective, order)) = order_of(name) else {
         return Ok((None, format!("objective {} has no bound", py_repr(name))));
     };
@@ -442,13 +665,30 @@ fn stated(
     let Some(bound) = lower_bound(&volumes, &weights, shrinks, &types)? else {
         return Ok((None, "the request is past a declared ceiling".to_owned()));
     };
+    let mut billed = 0;
+    if order.contains(&Key::Billed) {
+        let landed = objective == "lowest_landed_cost";
+        let term = match billed_types(configuration, containers, landed)? {
+            None => None,
+            Some(billed) => {
+                billed_key(landed, &billed, &volumes, &weights, shrinks, &types, &bound)?
+            }
+        };
+        let Some(term) = term else {
+            return Ok((
+                None,
+                "no priceable inventory carries a packing that attains the count bound".to_owned(),
+            ));
+        };
+        billed = term;
+    }
     // Read only where ranked, so a malformed `value` never touches another objective's bound.
     let values = if order.contains(&Key::ValueForgone) {
         value_runs(items)?
     } else {
         Vec::new()
     };
-    let vector = stated_vector(&order, &bound, &values, &volumes, shrinks, &types)?;
+    let vector = stated_vector(&order, &bound, billed, &values, &volumes, shrinks, &types)?;
     if vector.iter().any(|value| *value > MAX_BOUND_VALUE) {
         return Ok((
             None,
@@ -766,6 +1006,7 @@ mod tests {
                     let vector = stated_vector(
                         &order,
                         &bound,
+                        0,
                         &runs(instances, "value"),
                         &runs(instances, "volume"),
                         shrinks,
@@ -782,6 +1023,192 @@ mod tests {
             compared += 1;
         }
         assert!(compared > 400);
+        billed_cases_match(&scene);
+    }
+
+    /// The validator's billed key agrees with Python's on every billed fixture of the scene,
+    /// read from what each container bills.
+    fn billed_cases_match(scene: &serde_json::Value) {
+        let cases = scene["billed"].as_array().expect("billed cases");
+        assert!(!cases.is_empty(), "the billed objectives are not optional");
+        for case in cases {
+            let instances = case["instances"].as_array().expect("instances");
+            let raw = case["containers"].as_array().expect("containers");
+            let containers: Vec<BoundContainer> = raw
+                .iter()
+                .map(|c| BoundContainer {
+                    inner_volume: integer(&c["inner"]),
+                    base_area: integer(&c["base_area"]),
+                    height: integer(&c["height"]),
+                    usable: integer(&c["usable"]),
+                    cost_minor: integer(&c["cost_minor"]),
+                    payload: optional(&c["payload"]),
+                    max_items: optional(&c["max_items"]),
+                    quantity: optional(&c["quantity"]),
+                })
+                .collect();
+            let billed: Vec<BilledType> = raw
+                .iter()
+                .map(|c| BilledType {
+                    tare: integer(&c["tare"]),
+                    floor: integer(&c["tare"]).max(integer(&c["dimensional"])),
+                    brackets: c["brackets"]
+                        .as_array()
+                        .expect("brackets")
+                        .iter()
+                        .map(|pair| (integer(&pair[0]), optional(&pair[1])))
+                        .collect(),
+                })
+                .collect();
+            let (volumes, weights) = (runs(instances, "volume"), runs(instances, "weight"));
+            let shrinks = instances.iter().any(|i| i["shrinks"] == true);
+            let bound = lower_bound(&volumes, &weights, shrinks, &containers)
+                .expect("no overflow")
+                .expect("inside the ceiling");
+            let objective = case["objective"].as_str().expect("objective");
+            let (_, order) = order_of(&Json::str_of(objective)).expect("a billed objective");
+            let landed = objective == "lowest_landed_cost";
+            let stated = billed_key(
+                landed,
+                &billed,
+                &volumes,
+                &weights,
+                shrinks,
+                &containers,
+                &bound,
+            )
+            .expect("no overflow")
+            .map(|key| stated_vector(&order, &bound, key, &[], &volumes, shrinks, &containers))
+            .transpose()
+            .expect("no overflow");
+            let expected: Option<Vec<i128>> = case["vector"]
+                .as_array()
+                .map(|values| values.iter().map(integer).collect());
+            let fixture = &case["fixture"];
+            assert_eq!(stated, expected, "{objective} on {fixture}");
+        }
+    }
+
+    /// The bound `stated` recomputes for `request` as a feasible result's, with its reason.
+    fn stated_for(request: &serde_json::Value) -> (Option<Vec<i128>>, String) {
+        use crate::result_validation::{json, spec, units};
+        let request = json::parse(&request.to_string(), "request").expect("JSON");
+        let unit = units::length_unit(&request).expect("a length unit");
+        let items = spec::parse_items(&request, unit).expect("items");
+        let containers = spec::parse_containers(&request, unit).expect("containers");
+        stated(&request, &Json::str_of("feasible"), &items, &containers).expect("judged")
+    }
+
+    fn billed_request(
+        container: serde_json::Value,
+        configuration: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "items": [{"id": "brick", "weight": "100 g",
+                       "dimensions": {"length": "100", "width": "100", "height": "100"}}],
+            "containers": [container],
+            "configuration": configuration,
+        })
+    }
+
+    /// Each reason a billed objective states no bound, and the one no built-in objective
+    /// reaches any more.
+    #[test]
+    fn a_billed_request_withholds_its_bound_for_each_reason() {
+        let bulky = serde_json::json!({"id": "bulky",
+            "inner_dimensions": {"length": "500", "width": "500", "height": "500"},
+            "rate_table": {"weight_brackets_g": [1000], "prices_minor": [10]}});
+        let landed = serde_json::json!({"objective": "lowest_landed_cost",
+            "dimensional_weight_divisor": 5000, "dimensional_weight_length_unit": "cm",
+            "dimensional_weight_weight_unit": "kg"});
+        let unpriced = "no priceable inventory carries a packing that attains the count bound";
+        assert_eq!(
+            stated_for(&billed_request(bulky.clone(), landed)),
+            (None, unpriced.to_owned())
+        );
+        let undivided = serde_json::json!({"objective": "shipping_cost"});
+        assert_eq!(
+            stated_for(&billed_request(bulky.clone(), undivided)),
+            (None, unpriced.to_owned())
+        );
+        let custom = serde_json::json!({"objective": "custom"});
+        assert_eq!(
+            stated_for(&billed_request(bulky, custom)).1,
+            "objective 'custom' has no bound"
+        );
+        // A kilometre cube at divisor 1 m/kg bills 10^9 kg, past the portable ceiling.
+        let vast = serde_json::json!({"id": "vast",
+            "inner_dimensions": {"length": "1000000", "width": "1000000", "height": "1000000"}});
+        let metric = serde_json::json!({"objective": "shipping_cost",
+            "dimensional_weight_divisor": 1, "dimensional_weight_length_unit": "m",
+            "dimensional_weight_weight_unit": "kg"});
+        assert_eq!(
+            stated_for(&billed_request(vast, metric)).1,
+            "the shipping_cost key is past the portable ceiling"
+        );
+    }
+
+    /// The billed key's own edges: nothing opened bills nothing, an inventory too short to
+    /// open `L1` containers states nothing, and an absent rate table prices nothing.
+    #[test]
+    fn the_billed_key_reads_its_edges_as_the_reference_reads_them() {
+        let one = BoundContainer {
+            inner_volume: 10,
+            base_area: 1,
+            height: 10,
+            usable: 10,
+            cost_minor: 0,
+            payload: None,
+            max_items: None,
+            quantity: Some(1),
+        };
+        let billed = [BilledType {
+            tare: 0,
+            floor: 5,
+            brackets: vec![(10, Some(3))],
+        }];
+        let runs = [(1, 2)];
+        let key = |landed: bool, bound: [i128; 5]| {
+            billed_key(
+                landed,
+                &billed,
+                &runs,
+                &runs,
+                false,
+                std::slice::from_ref(&one),
+                &bound,
+            )
+            .expect("no overflow")
+        };
+        assert_eq!(key(false, [2, 0, 0, 0, 0]), Some(0));
+        assert_eq!(key(true, [2, 0, 0, 0, 0]), Some(0));
+        assert_eq!(key(false, [0, 2, 0, 0, 0]), None);
+        assert_eq!(key(true, [0, 2, 0, 0, 0]), None);
+        assert_eq!(rate_brackets(&Json::Null).unwrap(), Vec::new());
+    }
+
+    /// Greedy by cost per unit, one ceiling at the end, as the engine's integer cover.
+    #[test]
+    fn the_fractional_cover_rounds_once_and_respects_inventory() {
+        assert_eq!(
+            fractional_cover(&[(10, 3, None), (4, 1, None)], 7).unwrap(),
+            Some(24)
+        );
+        assert_eq!(
+            fractional_cover(&[(10, 3, Some(1)), (4, 1, None)], 7).unwrap(),
+            Some(26)
+        );
+        assert_eq!(fractional_cover(&[(10, 3, Some(1))], 7).unwrap(), None);
+        assert_eq!(fractional_cover(&[], 0).unwrap(), Some(0));
+        assert_eq!(fractional_cover(&[(0, 5, None)], 7).unwrap(), Some(0));
+        assert_eq!(
+            least_of_inventory(vec![(5, Some(1)), (2, Some(1))], 3).unwrap(),
+            None
+        );
+        assert_eq!(
+            least_of_inventory(vec![(5, None), (2, Some(1))], 3).unwrap(),
+            Some(12)
+        );
     }
 
     #[test]
@@ -886,6 +1313,32 @@ mod tests {
             codes(serde_json::json!({"code": "not_proven"})),
             Vec::<String>::new()
         );
+    }
+
+    /// The validator's own billed key agrees with what the engine states, and a
+    /// bound moved by one is caught.
+    #[test]
+    fn a_billed_objective_states_the_bound_the_validator_recomputes() {
+        let mut request: serde_json::Value = serde_json::from_str(REQUEST).expect("JSON");
+        request["configuration"] = serde_json::json!({
+            "objective": "shipping_cost", "dimensional_weight_divisor": 5000,
+            "dimensional_weight_length_unit": "cm", "dimensional_weight_weight_unit": "kg"});
+        let request = request.to_string();
+        let mut result = packed(&request);
+        assert!(result["optimality"]["lower_bound"].is_array(), "{result}");
+        let codes = |result: &serde_json::Value| -> Vec<String> {
+            issues(&request, result)
+                .into_iter()
+                .map(|issue| issue.code)
+                .collect()
+        };
+        assert_eq!(codes(&result), Vec::<String>::new());
+        let moved = result["optimality"]["lower_bound"][1]
+            .as_i64()
+            .expect("ticks")
+            - 1;
+        result["optimality"]["lower_bound"][1] = serde_json::json!(moved);
+        assert_eq!(codes(&result), ["optimality_bound_mismatch"]);
     }
 
     #[test]

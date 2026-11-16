@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use super::accounting::holds;
 use super::container::{SCORE_SCALE, ratio_ppm};
 use super::geometry::{Cuboid, Vertex, hull_volume, rotate_hull};
-use super::json::{Json, Ordered, Res, sort_py};
+use super::json::{Json, Ordered, Res, sort_fallible, sort_py};
 use super::num::{Ratio, add, ceil_div, floor_div, mul, mul_div, sub};
 use super::pyfmt::{fixed6, list, py_repr, py_str};
 use super::spec::{EXIT_DIRECTIONS, ItemSpec, is_rotation, rotation_of};
@@ -389,19 +389,13 @@ fn check_ground_contact(
 pub(crate) fn propagate_load(envelopes: &Envelopes<'_>, graph: &Graph) -> Res<Vec<i128>> {
     let list = entries(envelopes);
     let mut order: Vec<usize> = (0..list.len()).collect();
-    let mut failure = None;
-    order.sort_by(|&left, &right| {
+    sort_fallible(&mut order, |left, right| {
         let (a, b) = (&list[left].1.envelope, &list[right].1.envelope);
-        b.z2.cmp(&a.z2).then(b.z.cmp(&a.z)).then_with(|| {
-            list[left].0.py_cmp(list[right].0).unwrap_or_else(|error| {
-                failure = Some(error);
-                Ordering::Equal
-            })
-        })
-    });
-    if let Some(error) = failure {
-        return Err(error);
-    }
+        match b.z2.cmp(&a.z2).then(b.z.cmp(&a.z)) {
+            Ordering::Equal => list[left].0.py_cmp(list[right].0),
+            decided => Ok(decided),
+        }
+    })?;
     let mut loads = vec![0i128; list.len()];
     for upper in order {
         let Some(spec) = list[upper].1.spec else {
@@ -570,23 +564,56 @@ fn swept_region(envelope: &Cuboid, container: [i128; 3], direction: &str) -> Res
     Cuboid::new(x1, y1, z1, sub(x2, x1)?, sub(y2, y1)?, sub(z2, z1)?)
 }
 
-fn has_clear_exit(
-    item: usize,
-    list: &[(&Json, &Entry<'_>)],
-    present: &HashSet<usize>,
-    container: [i128; 3],
-    directions: &[&str],
-) -> Res<bool> {
-    for direction in directions {
-        let region = swept_region(&list[item].1.envelope, container, direction)?;
-        if !present
-            .iter()
-            .any(|other| *other != item && region.intersects(&list[*other].1.envelope))
-        {
-            return Ok(true);
+/// How many present items stand in each exit of every item due at the current stop. Taking an
+/// item out lowers the counts it was part of instead of re-testing every due item against
+/// every present one: an exit that is clear stays clear, so the verdict for each item is the
+/// same as a fresh test, in `O(n * d)` per removal rather than `O(|due| * n * d)`.
+struct ExitBlockers {
+    /// Per due item: the region swept toward each door and the present items inside it.
+    exits: HashMap<usize, Vec<(Cuboid, usize)>>,
+}
+
+impl ExitBlockers {
+    fn new(
+        due: &[usize],
+        list: &[(&Json, &Entry<'_>)],
+        present: &HashSet<usize>,
+        container: [i128; 3],
+        directions: &[&str],
+    ) -> Res<Self> {
+        let mut exits = HashMap::with_capacity(due.len());
+        for &item in due {
+            let mut item_exits = Vec::with_capacity(directions.len());
+            for direction in directions {
+                let region = swept_region(&list[item].1.envelope, container, direction)?;
+                let blockers = present
+                    .iter()
+                    .filter(|other| **other != item && region.intersects(&list[**other].1.envelope))
+                    .count();
+                item_exits.push((region, blockers));
+            }
+            exits.insert(item, item_exits);
+        }
+        Ok(Self { exits })
+    }
+
+    fn has_clear_exit(&self, item: usize) -> bool {
+        self.exits[&item].iter().any(|(_, blockers)| *blockers == 0)
+    }
+
+    /// `removed` leaves the container: every exit of `due` it stood in is one blocker lighter.
+    fn remove(&mut self, removed: usize, due: &[usize], list: &[(&Json, &Entry<'_>)]) {
+        for item in due.iter().filter(|item| **item != removed) {
+            let Some(item_exits) = self.exits.get_mut(item) else {
+                continue;
+            };
+            for (region, blockers) in item_exits {
+                if region.intersects(&list[removed].1.envelope) {
+                    *blockers -= 1;
+                }
+            }
         }
     }
-    Ok(false)
 }
 
 /// Items due at an earlier stop must all be removable -- unblocked
@@ -629,19 +656,18 @@ pub(crate) fn check_route_removal_order(
             .filter(|(index, value)| *value == stop && present.contains(index))
             .map(|(index, _)| *index)
             .collect();
+        let mut exits = ExitBlockers::new(&due, &list, &present, container, directions)?;
         while !due.is_empty() {
-            let mut removable = Vec::new();
-            for &item in &due {
-                if graph.direct_above[item]
-                    .iter()
-                    .any(|above| present.contains(above))
-                {
-                    continue;
-                }
-                if has_clear_exit(item, &list, &present, container, directions)? {
-                    removable.push(item);
-                }
-            }
+            let removable: Vec<usize> = due
+                .iter()
+                .copied()
+                .filter(|&item| {
+                    !graph.direct_above[item]
+                        .iter()
+                        .any(|above| present.contains(above))
+                        && exits.has_clear_exit(item)
+                })
+                .collect();
             let Some(chosen) = minimum_by_id(&removable, &list)? else {
                 let mut names: Vec<&Json> = due.iter().map(|index| list[*index].0).collect();
                 sort_py(&mut names)?;
@@ -656,6 +682,7 @@ pub(crate) fn check_route_removal_order(
             };
             present.remove(&chosen);
             due.retain(|item| *item != chosen);
+            exits.remove(chosen, &due, &list);
         }
     }
     Ok(())

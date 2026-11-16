@@ -398,3 +398,22 @@ fn an_override_of_every_kind_is_admitted() {
         assert!(answer.contains(r#""overrides":1"#), "{answer}");
     }
 }
+
+/// K2: zones are validated in code-point order of the zone key, so the zone named in the first
+/// refusal never depends on the map's own order.
+#[test]
+fn zones_are_validated_in_code_point_order_of_their_key() {
+    for (zones, first) in [
+        (r#"{"b":"x","2":"y"}"#, "[2]"),
+        (r#"{"2":"y","b":"x"}"#, "[2]"),
+        (r#"{"b":"x","B":"y","a":"z"}"#, "[B]"),
+        (r#"{"é":"x","z":"y"}"#, "[z]"),
+        (r#"{"😀":"x","￿":"y"}"#, "[\u{ffff}]"),
+    ] {
+        let version = format!(
+            r#"{{"effective_at":0,"dimensional_weight_divisor":1000,
+                "cost_per_dimensional_kg_minor":{zones}}}"#
+        );
+        refused(&quote_call(&tariff_document(&version), shipment()), first);
+    }
+}

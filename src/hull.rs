@@ -33,6 +33,13 @@ pub type Axis = [i64; 3];
 /// Smallest number of vertices that can enclose a volume.
 pub const MINIMUM_VERTICES: usize = 4;
 
+/// Most vertices a hull may carry (K3). Admission refuses a longer list before any hull is
+/// built, which keeps the `O(v^4)` volume search in `validate` at 32^4 steps at worst.
+pub const MAXIMUM_VERTICES: usize = 32;
+
+/// The refusal detail for a hull past `MAXIMUM_VERTICES`, one wording in every engine.
+pub const TOO_MANY_VERTICES: &str = "must have at most 32 vertices";
+
 /// Largest vertex coordinate a hull may carry, in ticks -- 6.25 m.
 ///
 /// Shared verbatim with the other engines. It is what bounds every product in this module,

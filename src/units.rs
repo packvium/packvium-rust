@@ -95,6 +95,18 @@ impl MeasureKind {
         })
     }
 
+    /// The unit words a measure written as text may end with, longest first so `lbs` is not
+    /// read as `s` after `lb`. The reference lists exactly these -- not `millimeter(s)`, which
+    /// it knows only as a stated unit -- and matches them ignoring case.
+    fn text_suffixes(self) -> &'static [&'static str] {
+        match self {
+            Self::Length => &[
+                "inches", "ticks", "inch", "tick", "mm", "cm", "ft", "in", "m",
+            ],
+            Self::Weight => &["ticks", "tick", "lbs", "mg", "kg", "oz", "lb", "g"],
+        }
+    }
+
     pub(crate) fn knows_unit(self, unit: &str) -> bool {
         self.multiplier(unit).is_some()
     }
@@ -118,7 +130,7 @@ fn unbounded_ticks(
     default_unit: &str,
     kind: MeasureKind,
 ) -> PackResult<(String, i128)> {
-    let (raw, unit) = scalar_and_unit(value, default_unit)?;
+    let (raw, unit) = scalar_and_unit(value, default_unit, kind)?;
     let multiplier = kind
         .multiplier(&unit)
         .ok_or_else(|| PackError::UnsupportedUnit(unit.trim().to_ascii_lowercase()))?;
@@ -166,7 +178,7 @@ pub(crate) fn overflowed_measure(
     kind: MeasureKind,
     ceiling: u64,
 ) -> Overflowed {
-    let Ok((raw, unit)) = scalar_and_unit(value, default_unit) else {
+    let Ok((raw, unit)) = scalar_and_unit(value, default_unit, kind) else {
         return Overflowed::Unreadable;
     };
     let (Some(multiplier), Some((negative, numerator, denominator))) =
@@ -189,28 +201,143 @@ pub(crate) fn overflowed_measure(
     }
 }
 
+/// How a measure's number is written. Python's grammar, and so every engine's: an optional
+/// sign, ASCII digits, and either a `.` with digits on both sides (at most
+/// `MAX_FRACTIONAL_DIGITS` after it), a `/` over digits, or a whole part then a fraction after
+/// whitespace. Nothing else -- no `1e2`, `0x64`, `1_0`, `100.`, `.5` -- and no sign inside a
+/// fraction. All pieces are digit runs.
+#[derive(Debug, Eq, PartialEq)]
+enum Written<'a> {
+    /// `whole` alone or `whole.fraction`; the fraction is empty for a whole number.
+    Decimal {
+        negative: bool,
+        whole: &'a str,
+        fraction: &'a str,
+    },
+    /// `numerator / denominator`.
+    Ratio {
+        negative: bool,
+        numerator: &'a str,
+        denominator: &'a str,
+    },
+    /// `whole numerator/denominator`; the sign of the text signs the whole value.
+    Mixed {
+        negative: bool,
+        whole: &'a str,
+        numerator: &'a str,
+        denominator: &'a str,
+    },
+}
+
+/// Past this many fractional digits a decimal is refused, the cap the reference shares with PHP.
+const MAX_FRACTIONAL_DIGITS: usize = 18;
+
+/// The whitespace of the reference's `\s` over ASCII text (space, tab, newline, return, form feed, vertical tab).
+fn is_written_space(character: char) -> bool {
+    matches!(character, ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c')
+}
+
+/// The leading run of ASCII digits, which must not be empty, and what follows it.
+fn digit_run(text: &str) -> Option<(&str, &str)> {
+    let length = text.bytes().take_while(u8::is_ascii_digit).count();
+    (length > 0).then(|| text.split_at(length))
+}
+
+/// The digits of `/ digits` ending the text, allowing whitespace around the slash.
+fn denominator_digits(text: &str) -> Option<&str> {
+    let after = text
+        .trim_start_matches(is_written_space)
+        .strip_prefix('/')?
+        .trim_start_matches(is_written_space);
+    digit_run(after)
+        .filter(|(_, rest)| rest.is_empty())
+        .map(|(digits, _)| digits)
+}
+
+/// `text` (already trimmed, its no-break spaces made plain) read in the measure grammar, or
+/// `None` when it is not a number at all. O(len(text)).
+fn read_written(text: &str) -> Option<Written<'_>> {
+    let (negative, unsigned) = match text.as_bytes().first()? {
+        b'-' => (true, &text[1..]),
+        b'+' => (false, &text[1..]),
+        _ => (false, text),
+    };
+    let (whole, rest) = digit_run(unsigned)?;
+    if rest.is_empty() {
+        return Some(Written::Decimal {
+            negative,
+            whole,
+            fraction: "",
+        });
+    }
+    if let Some(after_point) = rest.strip_prefix('.') {
+        let (fraction, tail) = digit_run(after_point)?;
+        return (tail.is_empty() && fraction.len() <= MAX_FRACTIONAL_DIGITS).then_some(
+            Written::Decimal {
+                negative,
+                whole,
+                fraction,
+            },
+        );
+    }
+    let after_space = rest.trim_start_matches(is_written_space);
+    if after_space.starts_with('/') {
+        return Some(Written::Ratio {
+            negative,
+            numerator: whole,
+            denominator: denominator_digits(after_space)?,
+        });
+    }
+    if after_space.len() == rest.len() {
+        return None;
+    }
+    let (numerator, tail) = digit_run(after_space)?;
+    Some(Written::Mixed {
+        negative,
+        whole,
+        numerator,
+        denominator: denominator_digits(tail)?,
+    })
+}
+
+/// A measure's text as the grammar reads it: trimmed, no-break spaces plain.
+fn normalized(text: &str) -> String {
+    text.trim().replace('\u{00a0}', " ")
+}
+
 /// `parse_rational` over little-endian decimal digits, without leading zeros: the sign,
 /// numerator and denominator, or `None` for any other text.
 fn exact_fraction(text: &str) -> Option<(bool, Vec<u8>, Vec<u8>)> {
-    let text = text.trim().replace('\u{00a0}', " ");
-    let negative = text.starts_with('-');
-    let signed = |part: &str| digits(part.strip_prefix(['+', '-']).unwrap_or(part));
-    let (numerator, denominator) = if let Some((whole, fraction)) = text.split_once(' ')
-        && let Some((numerator, denominator)) = fraction.split_once('/')
-    {
-        let denominator = digits(denominator.trim())?;
-        let whole = digits_mul(&signed(whole)?, &denominator);
-        (digits_add(&whole, &digits(numerator.trim())?), denominator)
-    } else if let Some((numerator, denominator)) = text.split_once('/') {
-        (signed(numerator.trim())?, digits(denominator.trim())?)
-    } else if let Some((whole, fraction)) = text.split_once('.') {
-        let shifted = format!("{}{fraction}", whole.trim_start_matches(['+', '-']));
-        (
-            digits(&shifted)?,
+    let text = normalized(text);
+    let (negative, numerator, denominator) = match read_written(&text)? {
+        Written::Decimal {
+            negative,
+            whole,
+            fraction,
+        } => (
+            negative,
+            digits(&format!("{whole}{fraction}"))?,
             digits(&format!("1{}", "0".repeat(fraction.len())))?,
-        )
-    } else {
-        (signed(&text)?, vec![1])
+        ),
+        Written::Ratio {
+            negative,
+            numerator,
+            denominator,
+        } => (negative, digits(numerator)?, digits(denominator)?),
+        Written::Mixed {
+            negative,
+            whole,
+            numerator,
+            denominator,
+        } => {
+            let denominator = digits(denominator)?;
+            let whole = digits_mul(&digits(whole)?, &denominator);
+            (
+                negative,
+                digits_add(&whole, &digits(numerator)?),
+                denominator,
+            )
+        }
     };
     if denominator.is_empty() {
         return None;
@@ -273,7 +400,11 @@ fn digits_cmp(a: &[u8], b: &[u8]) -> Ordering {
         .then_with(|| a.iter().rev().cmp(b.iter().rev()))
 }
 
-fn scalar_and_unit(value: &Value, default_unit: &str) -> PackResult<(String, String)> {
+fn scalar_and_unit(
+    value: &Value,
+    default_unit: &str,
+    kind: MeasureKind,
+) -> PackResult<(String, String)> {
     match value {
         Value::Object(map) => {
             let raw = map
@@ -287,29 +418,11 @@ fn scalar_and_unit(value: &Value, default_unit: &str) -> PackResult<(String, Str
         }
         Value::String(text) => {
             let trimmed = text.trim();
-            for suffix in [
-                "millimeters",
-                "millimeter",
-                "inches",
-                "ticks",
-                "inch",
-                "lbs",
-                "tick",
-                "mm",
-                "cm",
-                "ft",
-                "in",
-                "mg",
-                "kg",
-                "oz",
-                "lb",
-                "g",
-                "m",
-            ] {
-                if let Some(prefix) = trimmed.strip_suffix(suffix)
+            for suffix in kind.text_suffixes() {
+                if let Some(prefix) = strip_suffix_ignoring_case(trimmed, suffix)
                     && !prefix.trim().is_empty()
                 {
-                    return Ok((prefix.trim().to_owned(), suffix.to_owned()));
+                    return Ok((prefix.trim().to_owned(), (*suffix).to_owned()));
                 }
             }
             Ok((trimmed.to_owned(), default_unit.to_owned()))
@@ -317,6 +430,13 @@ fn scalar_and_unit(value: &Value, default_unit: &str) -> PackResult<(String, Str
         Value::Number(_) => Ok((scalar_text(value)?, default_unit.to_owned())),
         _ => Err(PackError::InvalidNumber(value.to_string())),
     }
+}
+
+/// `text` without a trailing `suffix` (an ASCII word) however the suffix is cased.
+fn strip_suffix_ignoring_case<'a>(text: &'a str, suffix: &str) -> Option<&'a str> {
+    let split = text.len().checked_sub(suffix.len())?;
+    let tail = text.get(split..)?;
+    tail.eq_ignore_ascii_case(suffix).then(|| &text[..split])
 }
 
 fn scalar_text(value: &Value) -> PackResult<String> {
@@ -328,61 +448,56 @@ fn scalar_text(value: &Value) -> PackResult<String> {
 }
 
 fn parse_rational(text: &str) -> PackResult<(i128, i128)> {
-    let text = text.trim().replace('\u{00a0}', " ");
-    if let Some((whole, fraction)) = text.split_once(' ')
-        && let Some((numerator, denominator)) = fraction.split_once('/')
-    {
-        let whole: i128 = whole
-            .parse()
-            .map_err(|_| PackError::InvalidNumber(text.clone()))?;
-        let numerator: i128 = numerator
-            .trim()
-            .parse()
-            .map_err(|_| PackError::InvalidNumber(text.clone()))?;
-        let denominator: i128 = denominator
-            .trim()
-            .parse()
-            .map_err(|_| PackError::InvalidNumber(text.clone()))?;
-        if denominator <= 0 {
-            return Err(PackError::InvalidNumber(text));
+    let text = normalized(text);
+    let invalid = || PackError::InvalidNumber(text.clone());
+    let number = |digits: &str| digits.parse::<i128>().map_err(|_| invalid());
+    let signed = |negative: bool, magnitude: i128| if negative { -magnitude } else { magnitude };
+    match read_written(&text).ok_or_else(invalid)? {
+        Written::Decimal {
+            negative,
+            whole,
+            fraction,
+        } => {
+            let denominator = 10_i128
+                .checked_pow(fraction.len() as u32)
+                .ok_or_else(invalid)?;
+            let fraction = if fraction.is_empty() {
+                0
+            } else {
+                number(fraction)?
+            };
+            let magnitude = number(whole)?
+                .checked_mul(denominator)
+                .and_then(|scaled| scaled.checked_add(fraction))
+                .ok_or_else(invalid)?;
+            Ok((signed(negative, magnitude), denominator))
         }
-        let sign = if whole < 0 { -1 } else { 1 };
-        return Ok((whole * denominator + sign * numerator, denominator));
-    }
-    if let Some((numerator, denominator)) = text.split_once('/') {
-        let numerator: i128 = numerator
-            .trim()
-            .parse()
-            .map_err(|_| PackError::InvalidNumber(text.clone()))?;
-        let denominator: i128 = denominator
-            .trim()
-            .parse()
-            .map_err(|_| PackError::InvalidNumber(text.clone()))?;
-        if denominator <= 0 {
-            return Err(PackError::InvalidNumber(text));
+        Written::Ratio {
+            negative,
+            numerator,
+            denominator,
+        } => match number(denominator)? {
+            0 => Err(invalid()),
+            denominator => Ok((signed(negative, number(numerator)?), denominator)),
+        },
+        Written::Mixed {
+            negative,
+            whole,
+            numerator,
+            denominator,
+        } => {
+            let denominator = number(denominator)?;
+            if denominator == 0 {
+                return Err(invalid());
+            }
+            let numerator = number(numerator)?;
+            let magnitude = number(whole)?
+                .checked_mul(denominator)
+                .and_then(|scaled| scaled.checked_add(numerator))
+                .ok_or_else(invalid)?;
+            Ok((signed(negative, magnitude), denominator))
         }
-        return Ok((numerator, denominator));
     }
-    if let Some((whole, fraction)) = text.split_once('.') {
-        let negative = whole.starts_with('-');
-        let absolute_whole = whole
-            .trim_start_matches(['+', '-'])
-            .parse::<i128>()
-            .map_err(|_| PackError::InvalidNumber(text.clone()))?;
-        let denominator = 10_i128
-            .checked_pow(fraction.len() as u32)
-            .ok_or_else(|| PackError::InvalidNumber(text.clone()))?;
-        let fraction = fraction
-            .parse::<i128>()
-            .map_err(|_| PackError::InvalidNumber(text.clone()))?;
-        let numerator = absolute_whole * denominator + fraction;
-        return Ok((if negative { -numerator } else { numerator }, denominator));
-    }
-    Ok((
-        text.parse()
-            .map_err(|_| PackError::InvalidNumber(text.clone()))?,
-        1,
-    ))
 }
 
 fn round_half_even(numerator: i128, denominator: i128) -> PackResult<i128> {

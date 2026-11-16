@@ -7,13 +7,23 @@
 
 use std::collections::BTreeMap;
 
-/// Exact `ceil(a * b / d)` for non-negative inputs, taken in `i128` so an ordinary
-/// gram-times-minor-unit product cannot overflow the 64-bit values it is built from.
-fn ceil_mul_div(a: i64, b: i64, d: i64) -> i64 {
+/// The largest amount a quote may report: 2^53 - 1, the largest integer every engine and
+/// every JSON reader holds exactly (the money ceiling, M2).
+const MAX_QUOTE_AMOUNT: i128 = (1 << 53) - 1;
+
+/// Exact `ceil(a * b / d)` for non-negative inputs, taken in `i128`: the product of two
+/// 64-bit values cannot overflow it, so nothing wraps before `reported` looks at the result.
+fn ceil_mul_div(a: i128, b: i128, d: i128) -> i128 {
     debug_assert!(d > 0 && a >= 0 && b >= 0);
-    let product = i128::from(a) * i128::from(b);
-    let divisor = i128::from(d);
-    ((product + divisor - 1) / divisor) as i64
+    (a * b + d - 1) / d
+}
+
+/// An amount the quote reports, narrowed only once it is known to be at most the ceiling.
+fn reported(amount: i128) -> Result<i64, RatingRejection> {
+    if amount > MAX_QUOTE_AMOUNT {
+        return Err(RatingRejection::AmountAboveCeiling(amount));
+    }
+    Ok(i64::try_from(amount).expect("an amount within 2^53 - 1 fits i64"))
 }
 
 /// One named accessorial: either a flat charge or a permille-of-base charge, never both.
@@ -25,11 +35,15 @@ pub struct AccessorialCharge {
 }
 
 impl AccessorialCharge {
-    pub fn charge_minor(&self, base_charge_minor: i64) -> i64 {
+    pub fn charge_minor(&self, base_charge_minor: i64) -> Result<i64, RatingRejection> {
         match (self.flat_charge_minor, self.permille_of_base) {
-            (Some(flat), _) => flat,
-            (None, Some(permille)) => ceil_mul_div(base_charge_minor, permille, 1000),
-            (None, None) => 0,
+            (Some(flat), _) => reported(i128::from(flat)),
+            (None, Some(permille)) => reported(ceil_mul_div(
+                i128::from(base_charge_minor),
+                i128::from(permille),
+                1000,
+            )),
+            (None, None) => Ok(0),
         }
     }
 }
@@ -76,12 +90,15 @@ pub struct RateBreakdown {
 
 /// A rejection the rating model is entitled to make, carried structurally so the API
 /// boundary never has to parse a reason back out of prose.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RatingRejection {
     TariffNotFound,
     NoEffectiveTariff,
     UnavailableZone(String),
     UnavailableAccessorials(Vec<String>),
+    /// A reported amount, exactly computed, is above 2^53 - 1; the API boundary reports it
+    /// as malformed input, since a double could not hold it.
+    AmountAboveCeiling(i128),
 }
 
 /// Per-`(carrier_id, service_id)` append-only tariff history.
@@ -171,37 +188,51 @@ pub fn rate_tariff(
         return Err(RatingRejection::UnavailableAccessorials(unknown));
     }
 
+    // Reported amounts are checked in reporting order, so the first one past the ceiling is
+    // the one named; each is computed exactly in `i128` first.
     // Dimensional weight in grams is volume (mm^3) over the divisor, rounded up.
-    let dimensional_weight_g =
-        ceil_mul_div(request.volume_mm3, 1, tariff.dimensional_weight_divisor);
-    let billed_weight_g = request.actual_weight_g.max(dimensional_weight_g);
+    let dimensional_weight_g = reported(ceil_mul_div(
+        i128::from(request.volume_mm3),
+        1,
+        i128::from(tariff.dimensional_weight_divisor),
+    ))?;
+    let billed_weight_g = reported(i128::from(
+        request.actual_weight_g.max(dimensional_weight_g),
+    ))?;
 
     let rate_per_kg = tariff.cost_per_dimensional_kg_minor[&request.zone];
-    let raw_base_charge_minor = ceil_mul_div(billed_weight_g, rate_per_kg, 1000);
-    let minimum_charge_applied = raw_base_charge_minor < tariff.minimum_charge_minor;
-    let base_charge_minor = if minimum_charge_applied {
-        tariff.minimum_charge_minor
+    let raw_base_charge_minor =
+        ceil_mul_div(i128::from(billed_weight_g), i128::from(rate_per_kg), 1000);
+    let minimum_charge_applied = raw_base_charge_minor < i128::from(tariff.minimum_charge_minor);
+    let base_charge_minor = reported(if minimum_charge_applied {
+        i128::from(tariff.minimum_charge_minor)
     } else {
         raw_base_charge_minor
-    };
+    })?;
 
-    let fuel_surcharge_minor =
-        ceil_mul_div(base_charge_minor, tariff.fuel_surcharge_permille, 1000);
+    let fuel_surcharge_minor = reported(ceil_mul_div(
+        i128::from(base_charge_minor),
+        i128::from(tariff.fuel_surcharge_permille),
+        1000,
+    ))?;
 
     let accessorial_charges_minor: Vec<(String, i64)> = request
         .requested_accessorials
         .iter()
         .map(|id| {
-            (
+            Ok((
                 id.clone(),
-                tariff.accessorials[id].charge_minor(base_charge_minor),
-            )
+                tariff.accessorials[id].charge_minor(base_charge_minor)?,
+            ))
         })
-        .collect();
-    let accessorial_total: i64 = accessorial_charges_minor
+        .collect::<Result<_, RatingRejection>>()?;
+    let accessorial_total: i128 = accessorial_charges_minor
         .iter()
-        .map(|(_, amount)| amount)
+        .map(|(_, amount)| i128::from(*amount))
         .sum();
+    let total_minor = reported(
+        i128::from(base_charge_minor) + i128::from(fuel_surcharge_minor) + accessorial_total,
+    )?;
 
     Ok(RateBreakdown {
         carrier_id: tariff.carrier_id.clone(),
@@ -215,6 +246,6 @@ pub fn rate_tariff(
         minimum_charge_applied,
         fuel_surcharge_minor,
         accessorial_charges_minor,
-        total_minor: base_charge_minor + fuel_surcharge_minor + accessorial_total,
+        total_minor,
     })
 }

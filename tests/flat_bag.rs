@@ -153,6 +153,7 @@ fn bag_container() -> Container {
         made_to_measure: None,
         pallet_overhang_limit: None,
         deck: None,
+        upright_frame: false,
     }
 }
 

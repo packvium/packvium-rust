@@ -356,14 +356,49 @@ impl Number {
 /// `sorted(values)` in place, by Python's ordering; values Python cannot order are its
 /// `TypeError`.
 pub(crate) fn sort_py(values: &mut [&Json]) -> Res<()> {
-    let mut failure = None;
-    values.sort_by(|left, right| {
-        left.py_cmp(right).unwrap_or_else(|error| {
-            failure = Some(error);
-            Ordering::Equal
-        })
-    });
-    failure.map_or(Ok(()), Err)
+    sort_fallible(values, |left, right| left.py_cmp(right))
+}
+
+/// A stable ascending sort whose comparison may refuse, as Python's `sorted` does when two
+/// values cannot be ordered: the first refusal is returned and `items` is left as it was.
+///
+/// Not `slice::sort_by`: a comparison that records a failure and answers `Equal` is not a total
+/// order, and since Rust 1.81 `sort_by` may panic on such input. A bottom-up merge sort only
+/// ever asks the comparison about two values and acts on the answer, so a refusal cannot put
+/// it in an inconsistent state. For inputs that never refuse the result is the stable sort,
+/// which is unique. O(n log n) time, O(n) space.
+pub(crate) fn sort_fallible<T: Copy>(
+    items: &mut [T],
+    mut compare: impl FnMut(T, T) -> Res<Ordering>,
+) -> Res<()> {
+    let length = items.len();
+    let mut source = items.to_vec();
+    let mut target = source.clone();
+    let mut width = 1;
+    while width < length {
+        for start in (0..length).step_by(2 * width) {
+            let middle = (start + width).min(length);
+            let end = (start + 2 * width).min(length);
+            let (mut left, mut right) = (start, middle);
+            for slot in &mut target[start..end] {
+                // The right run goes first only when strictly smaller, which keeps equal
+                // values in their original order.
+                let take_right = left == middle
+                    || (right < end && compare(source[right], source[left])? == Ordering::Less);
+                if take_right {
+                    *slot = source[right];
+                    right += 1;
+                } else {
+                    *slot = source[left];
+                    left += 1;
+                }
+            }
+        }
+        std::mem::swap(&mut source, &mut target);
+        width *= 2;
+    }
+    items.copy_from_slice(&source);
+    Ok(())
 }
 
 /// `int(text)` for a string: optional surrounding whitespace, an optional sign, ASCII digits
@@ -603,6 +638,29 @@ mod tests {
         let mut values = [read("1"), read("\"a\"")];
         let mut references: Vec<&Json> = values.iter_mut().map(|value| &*value).collect();
         assert!(sort_py(&mut references).is_err());
+    }
+
+    #[test]
+    fn a_fallible_sort_is_the_stable_sort_when_nothing_refuses() {
+        for length in 0..70_usize {
+            let mut keys: Vec<(u32, usize)> = (0..length)
+                .map(|index| ((index as u32).wrapping_mul(2_654_435_761) % 7, index))
+                .collect();
+            let mut expected = keys.clone();
+            expected.sort_by_key(|(key, _)| *key);
+            sort_fallible(&mut keys, |left, right| Ok(left.0.cmp(&right.0))).unwrap();
+            assert_eq!(keys, expected, "{length}");
+        }
+    }
+
+    #[test]
+    fn a_fallible_sort_stops_at_a_refusal_and_never_panics() {
+        let values = [read("1"), read("\"a\"")];
+        for count in [2_usize, 3, 21, 22, 100] {
+            let mut references: Vec<&Json> = (0..count).map(|index| &values[index % 2]).collect();
+            let refused = sort_py(&mut references).unwrap_err();
+            assert!(refused.message.starts_with("cannot order"), "{count}");
+        }
     }
 
     #[test]

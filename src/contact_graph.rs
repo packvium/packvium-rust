@@ -2,7 +2,7 @@
 //!
 //! A plain pairwise scan costs `O(n^2)` even for a regular lattice where each box
 //! touches only one box above and below.  Grouping by contact plane and hashing each
-//! footprint into at most four cells makes construction `O(n log n + q + e)` with the
+//! footprint into the cells it overlaps makes construction `O(n log n + q + e)` with the
 //! deterministic `BTreeMap`/`BTreeSet` implementation used here: `q` is broad-phase
 //! candidates and `e` is real support edges.  The exact overlap test remains the
 //! authority.  A physically dense graph can still have `e = O(n^2)`; no exact
@@ -70,13 +70,7 @@ impl ContactGraph {
     pub(crate) fn with_cell_hint(boxes: &[Aabb], cell_hint: i64) -> Self {
         let mut supporters = vec![Vec::new(); boxes.len()];
         let mut children = vec![Vec::new(); boxes.len()];
-        let cell = boxes
-            .iter()
-            .map(|box_| box_.dimensions.length.0.max(box_.dimensions.width.0))
-            .max()
-            .unwrap_or(1)
-            .max(cell_hint)
-            .max(1);
+        let cell = broad_phase_cell(boxes, cell_hint);
 
         let mut by_top = BTreeMap::<i64, Vec<usize>>::new();
         for (index, box_) in boxes.iter().enumerate() {
@@ -157,10 +151,9 @@ impl ContactGraph {
         let index = self.boxes.len();
         let footprint = box_.dimensions.length.0.max(box_.dimensions.width.0);
         if footprint > self.cell {
-            // The broad phase is only correct while its cell is at least as large as
-            // every box hashed into it or queried against it -- a larger box could step
-            // over cells in the middle of its own footprint and miss a real overlap. So
-            // this is a correctness fallback, not an optimisation choice.
+            // A box wider than the cell is still hashed correctly, into every cell it
+            // overlaps; rebuilding with it as the hint keeps this path's cost what it was
+            // when the cell had to be at least as wide as every box.
             let mut boxes = self.boxes.clone();
             boxes.push(box_);
             return Self::with_cell_hint(&boxes, footprint);
@@ -404,26 +397,47 @@ impl ContactGraph {
     }
 }
 
+/// The widest a box may be, in cells, before the cell is widened for it: a box is hashed
+/// into every cell it overlaps, so this bounds the cells one box occupies at `17 * 17`.
+const MAX_CELLS_ACROSS: i64 = 16;
+
+/// How much narrower than the widest box the narrowest may be before the cell stops
+/// following the widest.
+const UNIFORM_FOOTPRINT_RATIO: i64 = 4;
+
+/// The broad-phase cell for `boxes`. A hint at least as wide as every box is the caller's
+/// choice and kept, and so is the widest footprint when no box is more than
+/// `UNIFORM_FOOTPRINT_RATIO` times narrower than it: a bucket then holds a bounded number
+/// of boxes, and the solvers call this per candidate, so they pay one pass and nothing more.
+/// Otherwise the cell follows the median footprint, not the widest, so one pallet-wide box
+/// cannot put every small box in the same bucket; it is no finer than `1 / MAX_CELLS_ACROSS`
+/// of the widest, which bounds the cells the wide box is hashed into. `O(n)` for the pass,
+/// `O(n log n)` for the median.
+fn broad_phase_cell(boxes: &[Aabb], cell_hint: i64) -> i64 {
+    let footprint = |box_: &Aabb| box_.dimensions.length.0.max(box_.dimensions.width.0);
+    let widest = boxes.iter().map(footprint).max().unwrap_or(1);
+    if cell_hint >= widest {
+        return cell_hint.max(1);
+    }
+    let narrowest = boxes.iter().map(footprint).min().unwrap_or(1);
+    if widest <= narrowest.saturating_mul(UNIFORM_FOOTPRINT_RATIO) {
+        return widest.max(cell_hint).max(1);
+    }
+    let mut footprints: Vec<i64> = boxes.iter().map(footprint).collect();
+    footprints.sort_unstable();
+    let median = footprints[(footprints.len() - 1) / 2];
+    let finest = (widest + MAX_CELLS_ACROSS - 1) / MAX_CELLS_ACROSS;
+    median.max(finest).max(cell_hint).max(1)
+}
+
+/// Every cell the footprint overlaps, row by row. A box no wider than the cell occupies at
+/// most four.
 fn cells(box_: Aabb, cell: i64) -> impl Iterator<Item = (i64, i64)> {
     let x1 = box_.origin.x.div_euclid(cell);
     let y1 = box_.origin.y.div_euclid(cell);
-    let x2 = box_.x2().saturating_sub(1).div_euclid(cell);
-    let y2 = box_.y2().saturating_sub(1).div_euclid(cell);
-    let mut out = [(x1, y1); 4];
-    let mut len = 1;
-    if x2 != x1 {
-        out[len] = (x2, y1);
-        len += 1;
-    }
-    if y2 != y1 {
-        out[len] = (x1, y2);
-        len += 1;
-        if x2 != x1 {
-            out[len] = (x2, y2);
-            len += 1;
-        }
-    }
-    out.into_iter().take(len)
+    let x2 = box_.x2().saturating_sub(1).div_euclid(cell).max(x1);
+    let y2 = box_.y2().saturating_sub(1).div_euclid(cell).max(y1);
+    (y1..=y2).flat_map(move |y| (x1..=x2).map(move |x| (x, y)))
 }
 
 #[cfg(test)]
@@ -491,6 +505,61 @@ mod tests {
             support_ratio: 1.0,
             top_load: Weight(0),
             fixed: false,
+        }
+    }
+
+    fn sized(x: i64, y: i64, z: i64, side: i64, height: i64) -> Aabb {
+        Aabb {
+            origin: Point { x, y, z },
+            dimensions: Dimensions {
+                length: Length(side),
+                width: Length(side),
+                height: Length(height),
+            },
+        }
+    }
+
+    /// Two layers of 50 mm boxes, `columns * rows` each.
+    fn small_lattice(columns: i64, rows: i64) -> Vec<Aabb> {
+        (0..2)
+            .flat_map(|layer| {
+                (0..rows).flat_map(move |row| {
+                    (0..columns).map(move |column| sized(column * 50, row * 50, layer * 50, 50, 50))
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn one_pallet_wide_box_does_not_put_every_small_box_in_one_bucket() {
+        for (columns, rows) in [(25, 20), (50, 40)] {
+            let small = small_lattice(columns, rows);
+            let without = ContactGraph::new(&small);
+            let mut boxes = small.clone();
+            boxes.push(sized(100_000, 0, 0, 1200, 50));
+            let with = ContactGraph::new(&boxes);
+            // Sized by the widest box alone, the 500 boxes on the plane met all 501 below.
+            assert!(
+                with.candidate_checks <= 8 * without.candidate_checks,
+                "{} checks against {}",
+                with.candidate_checks,
+                without.candidate_checks
+            );
+            for (upper_index, upper) in boxes.iter().enumerate() {
+                let expected = boxes
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(lower_index, lower)| {
+                        let area = lower.overlap_area_xy(*upper);
+                        (lower_index != upper_index && lower.z2() == upper.origin.z && area > 0)
+                            .then_some(ContactEdge {
+                                index: lower_index,
+                                area,
+                            })
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(with.supporters(upper_index), expected);
+            }
         }
     }
 

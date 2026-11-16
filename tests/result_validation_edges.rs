@@ -280,6 +280,59 @@ fn fixed_placements_that_cannot_be_ordered_are_refused() {
     assert!(refused.message.starts_with("cannot order"), "{refused:?}");
 }
 
+/// S-09: more than twenty fixed placements whose item types alternate between numbers and
+/// strings used to hand `sort_by` a comparison that is not a total order, which panics on
+/// Rust 1.81 and later. The refusal is the same one a pair of them gives.
+#[test]
+fn many_fixed_placements_that_cannot_be_ordered_are_refused_not_a_panic() {
+    for count in 2..=64_usize {
+        let mut request = request();
+        let result = packed(&request);
+        request["fixed_placements"] = Value::Array(
+            (0..count)
+                .map(|index| {
+                    let item_type = if index % 2 == 0 {
+                        json!(index)
+                    } else {
+                        json!(format!("s{index:03}"))
+                    };
+                    fixed(item_type, &index.to_string())
+                })
+                .collect(),
+        );
+        let refused = refusal(&request, &result);
+        assert_eq!(refused.kind, RefusalKind::Shape, "{count}");
+        assert!(
+            refused.message.starts_with("cannot order"),
+            "{count}: {refused:?}"
+        );
+    }
+}
+
+/// Fixed placements that do order, past the size where the standard sort switches algorithm,
+/// are reported in Python's order.
+#[test]
+fn many_orderable_fixed_placements_are_reported_in_sorted_order() {
+    let mut request = request();
+    let result = packed(&request);
+    request["fixed_placements"] = Value::Array(
+        (0..64_u32)
+            .map(|index| fixed(json!("a"), &((index * 37) % 64 * 10).to_string()))
+            .collect(),
+    );
+    let details = issue_detail(&request, &result, "fixed_placement_moved");
+    let expected: Vec<String> = (0..64)
+        .map(|index| format!("a fixed in box#1 at ({}, 0, 0) LWH", index * 10))
+        .collect();
+    let mut by_number = expected.clone();
+    by_number.sort_by_key(|text| {
+        text.split(['(', ','])
+            .nth(1)
+            .and_then(|number| number.parse::<u32>().ok())
+    });
+    assert_eq!(details, by_number);
+}
+
 /// A boolean tick is Python's `int` for geometry, but prints as the boolean it is.
 #[test]
 fn an_unexpected_fixed_placement_prints_a_non_integer_tick_as_python_prints_it() {

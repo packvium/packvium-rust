@@ -99,6 +99,12 @@ pub(crate) struct ContainerSpec {
     /// 1.10: a gusseted bag's side gusset depth G in ticks, which widens the width girth to
     /// b + c <= W + G; 0 for a flat bag and every rigid container.
     pub(crate) side_gusset: i128,
+    /// 1.11: a gusseted bag's bottom gusset depth K in ticks, which lengthens the
+    /// length girth to 2(a + c) <= 2L + K; 0 where none is declared.
+    pub(crate) bottom_gusset: i128,
+    /// A bag standing on its bottom gusset, whose `inner` is then the `W x H x L`
+    /// frame it is packed in.
+    pub(crate) standing: bool,
     pub(crate) reports_achieved_extent: bool,
     pub(crate) made_to_measure: Option<MachineSpec>,
     /// The weight-bearing deck `(x, y, length, width)` inside a pallet's solving
@@ -252,8 +258,13 @@ pub(crate) fn parse_items(request: &Json, unit: &str) -> Res<Ordered<ItemSpec>> 
 pub(crate) fn parse_containers(request: &Json, unit: &str) -> Res<Ordered<ContainerSpec>> {
     let mut containers = Ordered::default();
     for raw in request.at("containers")?.list("request.containers")? {
-        let (inner, deck) =
-            frame_and_deck(dimensions(raw.at("inner_dimensions")?, unit)?, raw, unit)?;
+        let boundary = raw.get_null("deformable_boundary")?;
+        let standing = !boundary.is_null() && boundary.get_null("orientation")?.is_str("standing");
+        let mut declared = dimensions(raw.at("inner_dimensions")?, unit)?;
+        if standing {
+            declared = [declared[1], declared[2], declared[0]];
+        }
+        let (inner, deck) = frame_and_deck(declared, raw, unit)?;
         let spec = ContainerSpec {
             id: raw.at("id")?.clone(),
             inner,
@@ -288,9 +299,11 @@ pub(crate) fn parse_containers(request: &Json, unit: &str) -> Res<Ordered<Contai
                 to_ticks(value, "g", WEIGHT)
             })?,
             rate_table: raw.get_null("rate_table")?.clone(),
-            flat_bag: !raw.get_null("deformable_boundary")?.is_null(),
-            side_gusset: side_gusset(raw.get_null("deformable_boundary")?, unit)?,
-            reports_achieved_extent: !raw.get_null("deformable_boundary")?.is_null()
+            flat_bag: !boundary.is_null(),
+            side_gusset: gusset(boundary, "side_gusset_depth", unit)?,
+            bottom_gusset: gusset(boundary, "bottom_gusset_depth", unit)?,
+            standing,
+            reports_achieved_extent: !boundary.is_null()
                 || !raw.get_null("made_to_measure")?.is_null()
                 || deck.is_some(),
             made_to_measure: optional(raw, "made_to_measure", |machine| {
@@ -304,15 +317,12 @@ pub(crate) fn parse_containers(request: &Json, unit: &str) -> Res<Ordered<Contai
 }
 
 /// A pallet's solving frame and the deck inside it, else the declared size.
-/// A gusseted bag's side gusset depth in ticks, else 0.
-fn side_gusset(boundary: &Json, unit: &str) -> Res<i128> {
+/// A gusseted bag's side or bottom gusset depth in ticks, else 0.
+fn gusset(boundary: &Json, name: &str, unit: &str) -> Res<i128> {
     if boundary.is_null() {
         return Ok(0);
     }
-    optional(boundary, "side_gusset_depth", |depth| {
-        to_ticks(depth, unit, LENGTH)
-    })
-    .map(Option::unwrap_or_default)
+    optional(boundary, name, |depth| to_ticks(depth, unit, LENGTH)).map(Option::unwrap_or_default)
 }
 
 fn frame_and_deck(

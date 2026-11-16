@@ -4,6 +4,7 @@
 mod api;
 pub mod artifact_exports;
 pub mod artifacts;
+mod billing;
 pub mod bounds;
 mod canonical_json;
 pub mod commerce;
@@ -16,6 +17,7 @@ mod explain;
 mod fixed;
 mod geometry;
 mod hull;
+mod loads;
 mod made_to_measure;
 mod model;
 mod nested;
@@ -44,8 +46,8 @@ pub use explain::{
 pub use geometry::{Aabb, Dimensions, Point, Rotation, ShapeType};
 pub use made_to_measure::MadeToMeasure;
 pub use model::{
-    AlgorithmReport, Container, DeformableBoundary, EffortBudget, FixedPlacement, Item,
-    ItemInstance, Obstacle, PackedContainer, PackingConfig, PackingRequest, PackingResult,
+    AlgorithmReport, BagOrientation, Container, DeformableBoundary, EffortBudget, FixedPlacement,
+    Item, ItemInstance, Obstacle, PackedContainer, PackingConfig, PackingRequest, PackingResult,
     PackingStatus, Placement, ReasonProof, RejectionObservation, ResultFact, SolverMetrics,
     SolverProfile, StartRecord, UnpackedItem, aggregate_termination,
 };

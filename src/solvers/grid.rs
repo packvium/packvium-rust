@@ -49,7 +49,7 @@ fn grid_selection_key(
 
     let containers_needed = remaining.div_ceil((*capacity).max(1)) as i128;
     let cost = container.cost_minor as i128;
-    let per_layer = ((*nx as i128) * (*ny as i128)).max(1) as usize;
+    let per_layer = items_per_layer(*nx as i128, *ny as i128);
     let layers = count.div_ceil(per_layer);
     let top = if layers == 0 {
         0
@@ -199,7 +199,7 @@ pub fn try_grid(request: &PackingRequest, deadline: &Deadline) -> Option<Packing
                         .min(usize::try_from(maximum.0 / item.weight.0).unwrap_or(usize::MAX));
                 }
                 let useful = capacity.min(item.quantity);
-                let per_layer = ((nx as i128) * (ny as i128)).max(1) as usize;
+                let per_layer = items_per_layer(nx as i128, ny as i128);
                 let layers = useful.div_ceil(per_layer);
                 let top = if layers == 0 {
                     0
@@ -462,6 +462,12 @@ pub fn try_grid(request: &PackingRequest, deadline: &Deadline) -> Option<Packing
     })
 }
 
+/// Items in one layer of an `nx` by `ny` grid, at least 1 and clamped to `usize` so a
+/// product past a 32-bit address space cannot truncate to a smaller (or zero) count.
+fn items_per_layer(nx: i128, ny: i128) -> usize {
+    usize::try_from((nx * ny).max(1)).unwrap_or(usize::MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -470,6 +476,15 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn a_layer_holds_at_least_one_item_and_saturates_instead_of_truncating() {
+        assert_eq!(items_per_layer(0, 5), 1);
+        assert_eq!(items_per_layer(3, 4), 12);
+        // 2^32 would truncate to 0 as a 32-bit usize; here it must survive unchanged.
+        assert_eq!(items_per_layer(1 << 16, 1 << 16), 1usize << 32);
+        assert_eq!(items_per_layer(i128::from(u64::MAX), 4), usize::MAX);
+    }
 
     #[derive(Debug)]
     struct CheckBudgetClock(AtomicU64);
@@ -541,6 +556,7 @@ mod tests {
                 made_to_measure: None,
                 pallet_overhang_limit: None,
                 deck: None,
+                upright_frame: false,
             }],
             config: PackingConfig {
                 profile: SolverProfile::Fast,
@@ -619,6 +635,7 @@ mod tests {
                 made_to_measure: None,
                 pallet_overhang_limit: None,
                 deck: None,
+                upright_frame: false,
             },
         );
         let result = try_grid(&req, &no_deadline()).expect("grid should apply");
@@ -676,6 +693,7 @@ mod tests {
                 made_to_measure: None,
                 pallet_overhang_limit: None,
                 deck: None,
+                upright_frame: false,
             },
         );
         let result = try_grid(&req, &no_deadline()).expect("grid should apply");

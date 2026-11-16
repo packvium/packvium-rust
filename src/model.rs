@@ -133,6 +133,35 @@ impl Default for PackingConfig {
     }
 }
 
+impl PackingConfig {
+    /// What a carrier bills by volume for a box of `dimensions`, in weight ticks: `L * W * H`
+    /// in the configured length unit over the divisor, in the configured weight unit, floored.
+    /// Exact integer arithmetic, as a carrier's own calculator is reproduced by hand.
+    pub(crate) fn dimensional_weight_ticks(&self, dimensions: Dimensions) -> i128 {
+        let length_ticks_per_unit = match self.dimensional_weight_length_unit.as_str() {
+            "mm" => Length::TICKS_PER_MM as i128,
+            "cm" => (Length::TICKS_PER_MM * 10) as i128,
+            "m" => (Length::TICKS_PER_MM * 1_000) as i128,
+            "in" => Length::TICKS_PER_INCH as i128,
+            "ft" => (Length::TICKS_PER_INCH * 12) as i128,
+            _ => unreachable!("configuration units are validated at admission"),
+        };
+        let weight_ticks_per_unit = match self.dimensional_weight_weight_unit.as_str() {
+            "mg" => Weight::TICKS_PER_MG as i128,
+            "g" => Weight::TICKS_PER_G as i128,
+            "kg" => Weight::TICKS_PER_KG as i128,
+            "oz" => Weight::TICKS_PER_OZ as i128,
+            "lb" => Weight::TICKS_PER_LB as i128,
+            _ => unreachable!("configuration units are validated at admission"),
+        };
+        dimensions.volume() * weight_ticks_per_unit
+            / (length_ticks_per_unit.pow(3)
+                * self
+                    .dimensional_weight_divisor
+                    .expect("shipping_cost divisor is validated at admission"))
+    }
+}
+
 /// The one stacking-group predicate, shared by every holder of the three facts it reads.
 pub(crate) fn stacking_refusal(
     stackable: bool,
@@ -529,16 +558,23 @@ impl RateTable {
     ///
     /// `None` above the last bracket rather than a clamp to the top price: clamping would
     /// quietly under-price every oversize shipment and, worse, make the objective prefer
-    /// a packing the caller cannot actually ship at that price.
+    /// a packing the caller cannot actually ship at that price. A landed cost past `i64`
+    /// saturates at `i64::MAX` instead.
     pub fn charge_minor(&self, billed_weight_g: i64) -> Option<i64> {
         for (bound, price) in self.weight_brackets_g.iter().zip(&self.prices_minor) {
             if billed_weight_g <= *bound {
                 let base = (*price).max(self.minimum_charge_minor);
                 // Ceiling division, never a float: the surcharge is a share of the base,
                 // and rounding down would let a fractional unit of revenue vanish.
-                let surcharge =
-                    ceil_div(base as i128 * self.fuel_surcharge_permille as i128, 1000) as i64;
-                return Some(base + surcharge);
+                let surcharge = i64::try_from(ceil_div(
+                    i128::from(base) * i128::from(self.fuel_surcharge_permille),
+                    1000,
+                ))
+                .unwrap_or(i64::MAX);
+                // Admission holds the landed cost to 2^53 - 1 (M1), so this saturates only
+                // for a table built around it. It must not become `None`: that means
+                // "above the last bracket" to every caller, a false explanation.
+                return Some(base.saturating_add(surcharge));
             }
         }
         None
@@ -548,6 +584,15 @@ impl RateTable {
     /// rounding down would price a shipment fractionally over a bracket in the one below.
     pub fn grams(weight_ticks: i64) -> i64 {
         ceil_div(weight_ticks as i128, Weight::TICKS_PER_G as i128) as i64
+    }
+
+    /// `grams` for an exact `i128` billed weight, saturating at `i64::MAX`.
+    ///
+    /// A weight past the `i64` range must land above the top bracket (unpriceable), never
+    /// wrap into a cheap one; `i64::MAX` is above every bracket short of one stated as
+    /// `i64::MAX` itself.
+    pub fn grams_saturating(weight_ticks: i128) -> i64 {
+        i64::try_from(ceil_div(weight_ticks, Weight::TICKS_PER_G as i128)).unwrap_or(i64::MAX)
     }
 }
 
@@ -598,6 +643,9 @@ pub struct Container {
     /// The deck inside a solving frame. Set only by the solving frame, which widens
     /// `inner_dimensions` to the frame and drops the limit, so a frame is never widened twice.
     pub deck: Option<Deck>,
+    /// Set only by the solving frame: `inner_dimensions` is a standing bag's `W x H x L`
+    /// frame, and `declared_inner` turns it back. A frame is never turned twice.
+    pub upright_frame: bool,
 }
 
 /// How a deformable container conforms to its contents.
@@ -612,21 +660,110 @@ pub struct Container {
 ///
 /// `GussetedBag` (1.10) has side gussets of depth `G` folded into each long edge: the tube
 /// round the package's `y-z` section is `2(W + G)` long instead of `2W`, so the width sum
-/// becomes `b + c <= W + G`. The length sum is unchanged (no bottom gusset in 1.10), and
-/// `G = 0` would be the flat bag. `G` is positive and at most `W`, which `pack` checks.
+/// becomes `b + c <= W + G`. A bottom gusset (1.11) is one panel of depth `K` folded
+/// into the closed end: the loop along the bag runs front, bottom, back, `2L + K`, so the
+/// length sum becomes `2(a + c) <= 2L + K`, doubled to stay in integers. A depth of zero ticks
+/// is a gusset not declared (the JSON path refuses a declared zero), so at least one depth is
+/// positive, `G` at most `W` and `K` at most `2L`, which `pack` checks.
+/// A bag with a bottom gusset may stand on it ([`BagOrientation::Standing`]): the solving
+/// frame is then `W x H x L` and the same two loops go round other axes, `a + b <= W + G`
+/// across and `2(b + c) <= 2L + K` along.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeformableBoundary {
     FlatBag,
-    GussetedBag { side_gusset_depth: Length },
+    GussetedBag {
+        side_gusset_depth: Length,
+        /// 1.11; zero ticks is no bottom gusset.
+        bottom_gusset_depth: Length,
+        /// 1.11; standing requires a bottom gusset.
+        orientation: BagOrientation,
+    },
+}
+
+/// How a gusseted bag is packed: lying on its front sheet, or standing on its
+/// opened bottom gusset.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BagOrientation {
+    #[default]
+    Flat,
+    Standing,
 }
 
 impl DeformableBoundary {
-    /// The side gusset depth `G` in ticks; 0 for a flat bag.
+    /// The side gusset depth `G` in ticks; 0 where none is declared.
     pub fn side_gusset_ticks(self) -> i64 {
         match self {
             Self::FlatBag => 0,
-            Self::GussetedBag { side_gusset_depth } => side_gusset_depth.0,
+            Self::GussetedBag {
+                side_gusset_depth, ..
+            } => side_gusset_depth.0,
         }
+    }
+
+    /// The bottom gusset depth `K` in ticks; 0 where none is declared.
+    pub fn bottom_gusset_ticks(self) -> i64 {
+        match self {
+            Self::FlatBag => 0,
+            Self::GussetedBag {
+                bottom_gusset_depth,
+                ..
+            } => bottom_gusset_depth.0,
+        }
+    }
+
+    /// Whether the bag stands on its bottom gusset.
+    pub fn is_standing(self) -> bool {
+        matches!(
+            self,
+            Self::GussetedBag {
+                orientation: BagOrientation::Standing,
+                ..
+            }
+        )
+    }
+}
+
+/// The two loops of film round a bag's package, as axis pairs of the solving frame
+///. `along` is the loop down the length (`2L + K`, against the doubled sum of its
+/// two extents), `across` the loop round the width (`W + G`, against their plain sum). Lying
+/// flat they are `(x, z)` and `(y, z)`; standing, `(y, z)` and `(x, y)`. Limits are `i128`
+/// so `2L + K` and the doubled sums need no saturation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Girth {
+    pub(crate) along: (usize, usize),
+    pub(crate) along_limit: i128,
+    pub(crate) across: (usize, usize),
+    pub(crate) across_limit: i128,
+}
+
+impl Girth {
+    /// The loops of a bag declared `length x width` with gusset depths `side` and `bottom`
+    /// (0 where none), in its flat or standing frame.
+    pub(crate) fn of(length: i64, width: i64, side: i64, bottom: i64, standing: bool) -> Self {
+        let along_limit = 2 * i128::from(length) + i128::from(bottom);
+        let across_limit = i128::from(width) + i128::from(side);
+        if standing {
+            Self {
+                along: (1, 2),
+                along_limit,
+                across: (0, 1),
+                across_limit,
+            }
+        } else {
+            Self {
+                along: (0, 2),
+                along_limit,
+                across: (1, 2),
+                across_limit,
+            }
+        }
+    }
+
+    /// Whether a package of extents `(a, b, c)` passes both loops; the rigid frame is the
+    /// caller's own check. `O(1)`.
+    pub(crate) fn admits(&self, extent: [i64; 3]) -> bool {
+        let sum = |(i, j): (usize, usize)| i128::from(extent[i]) + i128::from(extent[j]);
+        2 * sum(self.along) <= self.along_limit && sum(self.across) <= self.across_limit
     }
 }
 
@@ -661,11 +798,21 @@ impl Container {
             made_to_measure: None,
             pallet_overhang_limit: None,
             deck: None,
+            upright_frame: false,
         }
     }
 
-    /// The inner size the caller declared: a solving frame's deck, else `inner_dimensions`.
+    /// The inner size the caller declared: a solving frame's deck, a standing bag's frame
+    /// turned back to `L x W x H`, else `inner_dimensions`.
     pub fn declared_inner(&self) -> Dimensions {
+        if self.upright_frame {
+            let inner = self.inner_dimensions;
+            return Dimensions {
+                length: inner.height,
+                width: inner.length,
+                height: inner.width,
+            };
+        }
         match self.deck {
             None => self.inner_dimensions,
             Some(deck) => Dimensions {
@@ -681,24 +828,32 @@ impl Container {
         self.deformable_boundary.is_some()
     }
 
-    /// The width girth limit `W + G` (`W` for a flat bag); computed once per search so the
-    /// per-candidate check stays two additions and two comparisons. `O(1)`.
+    /// The width girth limit `W + G` over the declared width (`W` for a flat bag). `O(1)`.
     pub fn girth_width_limit(&self) -> i64 {
         let gusset = self
             .deformable_boundary
             .map_or(0, DeformableBoundary::side_gusset_ticks);
-        self.inner_dimensions.width.0.saturating_add(gusset)
+        self.declared_inner().width.0.saturating_add(gusset)
     }
 
-    /// Whether a package of these extents passes both girth sums; the frame is the caller's.
-    /// Always true for a rigid container. Coordinates are `i64`, so the sums need no wider type.
+    /// A bag's two loops in the frame it is packed in; `None` for a rigid container. Computed
+    /// once per search, so the per-candidate check stays a few additions. `O(1)`.
+    pub(crate) fn girth(&self) -> Option<Girth> {
+        let boundary = self.deformable_boundary?;
+        let declared = self.declared_inner();
+        Some(Girth::of(
+            declared.length.0,
+            declared.width.0,
+            boundary.side_gusset_ticks(),
+            boundary.bottom_gusset_ticks(),
+            self.upright_frame,
+        ))
+    }
+
+    /// Whether a package of these extents passes both girth loops; the frame is the caller's.
+    /// Always true for a rigid container.
     pub fn girth_admits(&self, extent: [i64; 3]) -> bool {
-        !self.is_flat_bag()
-            || girth_within(
-                extent,
-                self.inner_dimensions.length.0,
-                self.girth_width_limit(),
-            )
+        self.girth().is_none_or(|girth| girth.admits(extent))
     }
 
     /// Whether one box of these dimensions, alone at the origin, fits this container empty.
@@ -706,12 +861,6 @@ impl Container {
         dimensions.fits_inside(self.inner_dimensions)
             && self.girth_admits([dimensions.length.0, dimensions.width.0, dimensions.height.0])
     }
-}
-
-/// `a + c <= length_limit` and `b + c <= width_limit`: the two girth sums against limits the
-/// caller computed once (`girth_width_limit`). `O(1)`.
-pub(crate) fn girth_within([a, b, c]: [i64; 3], length_limit: i64, width_limit: i64) -> bool {
-    a.saturating_add(c) <= length_limit && b.saturating_add(c) <= width_limit
 }
 
 /// `[max x2, max y2, max z2]` over the envelopes, `[0, 0, 0]` for none. `O(p)`.
@@ -2223,6 +2372,40 @@ mod tests {
 
     use std::collections::{BTreeMap, BTreeSet};
 
+    fn table(price: i64, fuel_permille: i64) -> RateTable {
+        RateTable {
+            weight_brackets_g: vec![1000],
+            prices_minor: vec![price],
+            minimum_charge_minor: 0,
+            fuel_surcharge_permille: fuel_permille,
+            currency: None,
+        }
+    }
+
+    #[test]
+    fn a_landed_cost_past_i64_saturates_and_is_never_a_bracket_miss() {
+        const LARGE: i64 = 9_007_199_254_740_991;
+        assert_eq!(table(LARGE, LARGE).charge_minor(1), Some(i64::MAX));
+        assert_eq!(table(i64::MAX, 1000).charge_minor(1), Some(i64::MAX));
+        assert_eq!(table(900, 0).charge_minor(2000), None);
+        // In range stays exact: 900 + ceil(900 * 120 / 1000).
+        assert_eq!(table(900, 120).charge_minor(1), Some(1008));
+    }
+
+    #[test]
+    fn a_billed_weight_past_i64_lands_above_every_bracket() {
+        let ticks = i128::from(i64::MAX) * i128::from(Weight::TICKS_PER_G) * 2 + 1;
+        assert_eq!(RateTable::grams_saturating(ticks), i64::MAX);
+        assert_eq!(
+            table(900, 0).charge_minor(RateTable::grams_saturating(ticks)),
+            None
+        );
+        assert_eq!(
+            RateTable::grams_saturating(i128::from(Weight::TICKS_PER_G) + 1),
+            2
+        );
+    }
+
     use super::*;
     use crate::geometry::{Dimensions, Point, Rotation, ShapeType};
     use crate::units::{Length, Weight};
@@ -2495,6 +2678,7 @@ mod tests {
             made_to_measure: None,
             pallet_overhang_limit: None,
             deck: None,
+            upright_frame: false,
         }
     }
 

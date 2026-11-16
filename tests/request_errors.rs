@@ -816,3 +816,94 @@ fn a_length_past_i64_is_too_long_rather_than_unreadable() {
     assert_eq!(error.reason(), "above_maximum");
     assert_eq!(error.field(), "/items/0/dimensions/length");
 }
+
+/// K1: the request door reads a measure exactly as the reference does -- an upper-case weight
+/// unit is a weight, and a decimal past eighteen fractional digits is not a measure.
+#[test]
+fn a_measure_is_read_in_the_reference_grammar() {
+    let mut request = base();
+    request["items"][0]["weight"] = json!("1 G");
+    pack_json(&request.to_string()).expect("1 G is a weight in grams");
+    request["items"][0]["dimensions"]["length"] = json!("100.123456789012345678");
+    pack_json(&request.to_string()).expect("eighteen fractional digits are read");
+
+    for (length, field) in [
+        ("1.1234567890123456789", "/items/0/dimensions/length"),
+        ("100.", "/items/0/dimensions/length"),
+        (".5", "/items/0/dimensions/length"),
+        ("0x64", "/items/0/dimensions/length"),
+    ] {
+        let mut request = base();
+        request["items"][0]["dimensions"]["length"] = json!(length);
+        assert_eq!(
+            outcome(&refused(&request)),
+            (
+                "invalid_request",
+                "wrong_type",
+                field,
+                format!("invalid_request: {field}: must be a measure")
+            ),
+            "{length}"
+        );
+    }
+}
+
+/// A lattice of `count` distinct points, so a hull with that many vertices has a volume.
+fn lattice(count: usize) -> Value {
+    Value::Array(
+        (0..count)
+            .map(|n| json!({ "x": (n % 4).to_string(), "y": (n / 4 % 4).to_string(), "z": (n / 16).to_string() }))
+            .collect(),
+    )
+}
+
+fn hull_request(vertices: Value) -> Value {
+    let mut request = base();
+    request["items"][0]["shape_type"] = json!("convex_hull");
+    request["items"][0]["hull_vertices"] = vertices;
+    request
+}
+
+/// K3: 32 vertices are admitted and 33 are refused at admission, before any hull is built.
+#[test]
+fn a_hull_holds_at_most_thirty_two_vertices() {
+    pack_json(&hull_request(lattice(32)).to_string()).expect("32 vertices are admitted");
+    assert_eq!(
+        outcome(&refused(&hull_request(lattice(33)))),
+        (
+            "invalid_request",
+            "above_maximum",
+            "/items/0/hull_vertices",
+            "invalid_request: /items/0/hull_vertices: must have at most 32 vertices".to_owned()
+        )
+    );
+}
+
+/// The cap is read before any per-vertex rule: 33 entries that are not even points are over
+/// the cap, and a value that is not a list reports its own type first.
+#[test]
+fn the_vertex_cap_comes_before_the_vertex_rules() {
+    let junk = Value::Array(vec![json!("not a point"); 33]);
+    assert_eq!(refused(&hull_request(junk)).reason(), "above_maximum");
+    let error = refused(&hull_request(json!(33)));
+    assert_eq!(
+        (error.reason(), error.to_string()),
+        (
+            "wrong_type",
+            "invalid_request: /items/0/hull_vertices: must be a list".to_owned()
+        )
+    );
+}
+
+/// The object door of `rebalance_json` shares the admission rule.
+#[test]
+fn rebalance_refuses_an_oversized_hull() {
+    let request = hull_request(lattice(33)).to_string();
+    match packvium_core::rebalance_json(&request, "{}", 1) {
+        Err(PackError::InvalidRequest(error)) => {
+            assert_eq!(error.reason(), "above_maximum");
+            assert_eq!(error.field(), "/items/0/hull_vertices");
+        }
+        other => panic!("expected a request error, got {other:?}"),
+    }
+}

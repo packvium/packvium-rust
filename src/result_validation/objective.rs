@@ -1,11 +1,10 @@
 //! The objective vector recomputed from the result alone, and the request-level rules that
 //! only the whole result can answer: fixed placements, groups and solver selection.
 
-use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use super::container::{SCORE_SCALE, billed_size, unused_ppm};
-use super::json::{EMPTY_LIST, Json, Ordered, Res, sort_py};
+use super::json::{EMPTY_LIST, Json, Ordered, Res, sort_fallible, sort_py};
 use super::num::{add, ceil_div, floor_div, mul, mul_div, sum};
 use super::pyfmt::{int_list, int_tuple, py_repr, py_str};
 use super::spec::{ContainerSpec, ItemSpec};
@@ -20,7 +19,7 @@ pub(crate) struct Inputs<'a> {
 }
 
 /// `floor(volume * weight ticks per unit / (length ticks per unit ^ 3 * divisor))`.
-fn dimensional_weight(
+pub(crate) fn dimensional_weight(
     size: [i128; 3],
     divisor: i128,
     length_unit: &str,
@@ -514,14 +513,8 @@ fn position_tuple(key: &FixedKey) -> String {
 }
 
 fn sorted_keys(mut keys: Vec<&FixedKey>) -> Res<Vec<&FixedKey>> {
-    let mut failure = None;
-    keys.sort_by(|left, right| {
-        Json::List(left.to_vec())
-            .py_cmp(&Json::List(right.to_vec()))
-            .unwrap_or_else(|error| {
-                failure = Some(error);
-                Ordering::Equal
-            })
-    });
-    failure.map_or(Ok(keys), Err)
+    sort_fallible(&mut keys, |left, right| {
+        Json::List(left.to_vec()).py_cmp(&Json::List(right.to_vec()))
+    })?;
+    Ok(keys)
 }

@@ -141,7 +141,7 @@ pub fn pack_exact_one(
         };
         let initial_key = visited.keys.of(&initial);
         if !deadline.expired()
-            && visited.seen.insert(initial_key.clone())
+            && visited.first_visit(&initial_key)
             && !deadline.effort_stops(request, &metrics)
         {
             search(
@@ -625,7 +625,8 @@ fn occupies_its_declared_volume(item: &Item) -> bool {
 
 /// A search state up to the labelling of interchangeable instances. Item types are
 /// numbered once per search so a key is five machine words per placement, not a string,
-/// and the set stays small: at most one entry per node the effort budget admits.
+/// and the set stays small: at most one entry per node the effort budget admits, and never
+/// more than [`VISITED_STATE_ENTRIES`] however far that budget or the time limit is raised.
 ///
 /// Sorting is sound only when future decisions are independent of insertion order. Load
 /// settling hands an indivisible integer remainder to the last supporter, while extension
@@ -634,9 +635,30 @@ fn occupies_its_declared_volume(item: &Item) -> bool {
 /// item-order permutation tree; identical instances remain interchangeable in both modes.
 type StateKey = Vec<(u32, i64, i64, i64, u8)>;
 
+/// The most states one container's search remembers. The fixture corpus peaks near 21,000
+/// and a 20 s search of twelve items near 220,000, growing about linearly with time, so a
+/// raised `exact_item_limit` with a long limit would otherwise hold gigabytes. A full set is
+/// emptied, as `hull::SHAPE_CACHE_ENTRIES` empties its memo: states reached again are
+/// expanded again, which costs pruning and never changes what a state leads to.
+const VISITED_STATE_ENTRIES: usize = 262_144;
+
 struct VisitedStates {
     keys: StateKeys,
     seen: BTreeSet<StateKey>,
+}
+
+impl VisitedStates {
+    /// Records `key` and says whether it was new. `O(log n)` for `n` states held.
+    fn first_visit(&mut self, key: &StateKey) -> bool {
+        if self.seen.contains(key) {
+            return false;
+        }
+        if self.seen.len() >= VISITED_STATE_ENTRIES {
+            self.seen.clear();
+        }
+        self.seen.insert(key.clone());
+        true
+    }
 }
 
 struct StateKeys {
@@ -793,10 +815,9 @@ fn search(
                 continue;
             }
             let next_key = visited.keys.extend(&state_key, profile.type_id, &candidate);
-            if visited.seen.contains(&next_key) {
+            if !visited.first_visit(&next_key) {
                 continue;
             }
-            visited.seen.insert(next_key.clone());
             if deadline.effort_stops(request, metrics) {
                 continue;
             }
@@ -830,6 +851,29 @@ fn search(
 mod tests {
     use super::*;
     use crate::api::pack_json;
+
+    #[test]
+    fn the_visited_set_is_emptied_at_its_ceiling_and_keeps_answering_correctly() {
+        let mut visited = VisitedStates {
+            keys: StateKeys::new(&[], false),
+            seen: BTreeSet::new(),
+        };
+        let key = |index: i64| vec![(0, index, 0, 0, 0)];
+        for index in 0..VISITED_STATE_ENTRIES as i64 {
+            assert!(visited.first_visit(&key(index)));
+        }
+        assert_eq!(visited.seen.len(), VISITED_STATE_ENTRIES);
+        assert!(!visited.first_visit(&key(7)), "a held state is not new");
+        assert_eq!(visited.seen.len(), VISITED_STATE_ENTRIES);
+        // One past the ceiling empties the set and then holds only the new state.
+        assert!(visited.first_visit(&key(-1)));
+        assert_eq!(visited.seen.len(), 1);
+        assert!(
+            visited.first_visit(&key(7)),
+            "a forgotten state is searched again"
+        );
+        assert!(!visited.first_visit(&key(7)));
+    }
 
     fn open_height_request(max_search_nodes: u64) -> String {
         format!(

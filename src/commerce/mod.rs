@@ -90,7 +90,7 @@ pub fn quote_json(input: &str) -> Result<String, CommerceInputError> {
         Ok(
             match resolve_tariff(&loaded.carriers, &carrier_id, &service_id, request, pin) {
                 Err(rejection) => Err(rejection),
-                Ok(tariff) => rate(tariff, &rating_request)
+                Ok(tariff) => rate(tariff, &rating_request)?
                     .map(|breakdown| json!({"quote": quote_payload(&breakdown)})),
             },
         )
@@ -307,8 +307,22 @@ fn resolve_tariff<'a>(
         })
 }
 
-fn rate(tariff: &Tariff, request: &RatingRequest) -> Result<RateBreakdown, Rejection> {
-    rating::rate_tariff(tariff, request).map_err(|rejection| {
+/// The outer `Err` is a quote an amount of which is above 2^53 - 1 (a malformed request, as the
+/// reference engine treats it); the inner one is a rejection the model is entitled to make.
+fn rate(
+    tariff: &Tariff,
+    request: &RatingRequest,
+) -> Result<Result<RateBreakdown, Rejection>, CommerceInputError> {
+    let rated = rating::rate_tariff(tariff, request);
+    if let Err(RatingRejection::AmountAboveCeiling(amount)) = rated {
+        return Err(CommerceInputError {
+            path: "request".to_owned(),
+            message: format!(
+                "quote amount {amount} is above 9007199254740991 and cannot be represented exactly"
+            ),
+        });
+    }
+    Ok(rated.map_err(|rejection| {
         let mut fields = Map::new();
         fields.insert("carrier_id".to_owned(), json!(tariff.carrier_id));
         fields.insert("service_id".to_owned(), json!(tariff.service_id));
@@ -330,12 +344,14 @@ fn rate(tariff: &Tariff, request: &RatingRequest) -> Result<RateBreakdown, Rejec
             }
             // A resolved tariff cannot then be missing; both remaining variants are
             // produced only by resolution, which has already succeeded here.
-            RatingRejection::TariffNotFound | RatingRejection::NoEffectiveTariff => Rejection {
+            RatingRejection::TariffNotFound
+            | RatingRejection::NoEffectiveTariff
+            | RatingRejection::AmountAboveCeiling(_) => Rejection {
                 code: "tariff_not_found",
                 fields,
             },
         }
-    })
+    }))
 }
 
 fn pinned_rules<'a>(

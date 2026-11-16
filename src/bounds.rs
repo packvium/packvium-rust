@@ -28,10 +28,16 @@
 //! of the container types by cost. With every quantity 1 that is the document's
 //! `O(n log n + c log c)`. No geometry is touched and no candidate position is generated,
 //! which is why it is computed once per pack, before any solver runs.
+//!
+//! `shipping_cost` and `lowest_landed_cost` add one key each for what a carrier bills
+//!: `O(c log c)` for the billed weight, and `O(c b log t + c b log(c b))` for the
+//! landed charge over `b` rate-table brackets per type -- one binary search over prefix sums
+//! per bracket, then one sort of the `c b` offers by cost per unit.
 
 use crate::geometry::ShapeType;
-use crate::model::{Container, Item, ItemInstance, PackingRequest};
+use crate::model::{Container, Item, ItemInstance, PackingConfig, PackingRequest};
 use serde_json::Value;
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap};
 
 /// Parts per million, the scale keys 3 and 4 of the objective are carried at.
@@ -189,21 +195,111 @@ enum Key {
     ValueForgone,
     AchievedHeight,
     UnpackedVolumePpm,
+    BilledWeight,
+    LandedCharge,
 }
 
 /// Where each covered objective reads its bounds, key by key in its own score order.
-/// `shipping_cost` and `lowest_landed_cost` have none: a vector compared against a score that
-/// ranks other quantities means nothing.
+/// `shipping_cost` and `lowest_landed_cost` read what a carrier bills, from the
+/// configuration's dimensional-weight divisor.
 fn objective_order(objective: &str) -> Option<[Key; 5]> {
-    use Key::{AchievedHeight, Bound, UnpackedVolumePpm, ValueForgone};
+    use Key::{AchievedHeight, BilledWeight, Bound, LandedCharge, UnpackedVolumePpm, ValueForgone};
     match objective {
         "default" => Some([Bound(0), Bound(1), Bound(2), Bound(3), Bound(4)]),
         "lowest_cost" => Some([Bound(0), Bound(2), Bound(1), Bound(3), Bound(4)]),
         "maximum_value" => Some([Bound(0), ValueForgone, Bound(1), Bound(2), Bound(3)]),
         "open_dimension_height" => Some([Bound(0), AchievedHeight, Bound(1), Bound(2), Bound(3)]),
         "maximum_volume" => Some([UnpackedVolumePpm, Bound(0), Bound(1), Bound(2), Bound(3)]),
+        "shipping_cost" => Some([Bound(0), BilledWeight, Bound(1), Bound(3), Bound(4)]),
+        "lowest_landed_cost" => Some([Bound(0), LandedCharge, Bound(1), Bound(3), Bound(4)]),
         _ => None,
     }
+}
+
+/// Why one objective's bound is not stated: a declared ceiling, or a billed objective whose
+/// inventory cannot carry, at any price it lists, a packing that attains `L0`. No
+/// answer is compared against a bound then, so none is stated.
+#[derive(Debug, PartialEq, Eq)]
+enum Withheld {
+    Overflow,
+    Unpriceable,
+}
+
+impl From<BoundOverflow> for Withheld {
+    fn from(_: BoundOverflow) -> Self {
+        Self::Overflow
+    }
+}
+
+/// What a carrier can bill one container of a type, at the least.
+///
+/// `tare` and `dimensional` are weight ticks: an opened container is billed
+/// `max(tare + payload, dimensional)`, so `max(tare, dimensional)` is its floor whatever it
+/// carries. `brackets` is its rate table as `(upper bound in weight ticks, charge in minor
+/// units)`, the charge already floored at the minimum and surcharged, or empty where the
+/// objective prices nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Billing {
+    tare: i128,
+    dimensional: i128,
+    brackets: Vec<(i128, Option<i128>)>,
+}
+
+impl Billing {
+    fn floor(&self) -> i128 {
+        self.tare.max(self.dimensional)
+    }
+}
+
+/// Each type's `Billing`, or `None` without a divisor to bill by.
+///
+/// A rigid container is billed on its declared outer size, else its declared inner one; a
+/// pallet whose load overhangs is billed larger per side, never smaller, and dimensional
+/// weight only grows with each side, so the declared size is a floor. A bag is billed on the
+/// package its contents make, which can be smaller than declared, so its floor is 0.
+fn billing_for(containers: &[Container], config: &PackingConfig) -> Option<Vec<Billing>> {
+    config.dimensional_weight_divisor?;
+    let landed = config.objective == "lowest_landed_cost";
+    Some(
+        containers
+            .iter()
+            .map(|container| Billing {
+                tare: i128::from(container.tare_weight.0),
+                dimensional: if container.is_flat_bag() {
+                    0
+                } else {
+                    config.dimensional_weight_ticks(
+                        container
+                            .outer_dimensions
+                            .unwrap_or_else(|| container.declared_inner()),
+                    )
+                },
+                brackets: if landed {
+                    brackets(container)
+                } else {
+                    Vec::new()
+                },
+            })
+            .collect(),
+    )
+}
+
+/// The rate table as `(bound in weight ticks, charge)`; the charge at a bracket's bound is
+/// that bracket's charge, since the bound is the heaviest weight it prices.
+fn brackets(container: &Container) -> Vec<(i128, Option<i128>)> {
+    let Some(table) = &container.rate_table else {
+        return Vec::new();
+    };
+    table
+        .weight_brackets_g
+        .iter()
+        .map(|&bound| {
+            (
+                i128::from(bound) * i128::from(crate::units::Weight::TICKS_PER_G),
+                table.charge_minor(bound).map(i128::from),
+            )
+        })
+        .collect()
 }
 
 /// The request's bound in its objective's own score order, or `None` where none is stated.
@@ -213,7 +309,8 @@ fn objective_order(objective: &str) -> Option<[Key; 5]> {
 /// for a request with a `made_to_measure` container (D13: the unused-volume key would
 /// be taken from the machine maximum while the score uses the fabricated box), and for a
 /// request past a declared ceiling, which withholds the bound and nothing else
-/// (OPTIMALITY-GAP.md § 1.5). Computed from the request alone, independently of the solver
+/// (OPTIMALITY-GAP.md § 1.5), and for a billed objective without a divisor or whose inventory
+/// cannot carry a packing that attains `L0` at a price. Computed from the request alone, independently of the solver
 /// and deadline; emission also checks the result's score and the portable gap ceiling. An
 /// objective's own key past `MAX_BOUND_VALUE` withholds that objective's bound only.
 pub fn for_request(request: &PackingRequest) -> Option<Vec<i128>> {
@@ -225,8 +322,13 @@ pub fn for_request(request: &PackingRequest) -> Option<Vec<i128>> {
     {
         return None;
     }
+    let billings = if order.contains(&Key::BilledWeight) || order.contains(&Key::LandedCharge) {
+        billing_for(&request.containers, &request.config)?
+    } else {
+        Vec::new()
+    };
     Inputs::of_items(&request.items, &request.containers)
-        .objective_vector(&order)
+        .objective_vector(&order, &billings)
         .ok()
 }
 
@@ -283,26 +385,136 @@ impl Inputs {
     }
 
     /// The bound in a covered objective's score order, refused where the predicate refuses
-    /// the five bounds or the objective's own key passes `MAX_BOUND_VALUE`.
-    fn objective_vector(&self, order: &[Key; 5]) -> Result<Vec<i128>, BoundOverflow> {
+    /// the five bounds or the objective's own key passes `MAX_BOUND_VALUE`, and withheld where
+    /// a billed objective has no priceable answer to bound. `billings` is one per container
+    /// type, read only by the billed keys.
+    fn objective_vector(
+        &self,
+        order: &[Key; 5],
+        billings: &[Billing],
+    ) -> Result<Vec<i128>, Withheld> {
         let bounds = self.bounds()?;
         let vector = bounds.as_vector();
+        let (unpacked, opened) = (bounds.unpacked_count, bounds.container_count);
         order
             .iter()
             .map(|&key| match key {
                 Key::Bound(position) => Ok(vector[position]),
-                Key::ValueForgone => value_forgone_bound(&self.values, bounds.unpacked_count),
+                Key::ValueForgone => {
+                    value_forgone_bound(&self.values, unpacked).map_err(Withheld::from)
+                }
                 Key::AchievedHeight => achieved_height_bound(
                     &self.volumes,
                     self.shrinks,
-                    run_count(&self.volumes) - bounds.unpacked_count,
+                    run_count(&self.volumes) - unpacked,
                     &self.types,
-                ),
+                )
+                .map_err(Withheld::from),
                 Key::UnpackedVolumePpm => {
                     unpacked_volume_bound(&self.volumes, self.shrinks, &self.types)
+                        .map_err(Withheld::from)
                 }
+                Key::BilledWeight => self.billed_weight_bound(billings, unpacked, opened),
+                Key::LandedCharge => self.landed_charge_bound(billings, unpacked, opened),
             })
             .collect()
+    }
+
+    /// `shipping_cost`'s second key, summed billed weight in ticks.
+    ///
+    /// A packing that leaves exactly `unpacked` behind opens at least `opened` containers and
+    /// carries at least the lightest `n - unpacked` instances. Each opened container is billed
+    /// `max(tare + payload, dimensional)`, at least its floor, and a sum of maxima is at least
+    /// either sum on its own, so the two can be taken over different types. Every term is
+    /// non-negative, so opening more only adds. `O(c log c)`.
+    fn billed_weight_bound(
+        &self,
+        billings: &[Billing],
+        unpacked: i128,
+        opened: i128,
+    ) -> Result<i128, Withheld> {
+        if opened == 0 {
+            return Ok(0);
+        }
+        let least = |weight: fn(&Billing) -> i128| {
+            let quantities = self.types.iter().map(|container| container.quantity);
+            least_of_inventory(
+                billings.iter().map(weight).zip(quantities),
+                opened,
+                "billed weight",
+            )
+        };
+        let (Some(floors), Some(tares)) = (least(Billing::floor)?, least(|b| b.tare)?) else {
+            return Err(Withheld::Unpriceable);
+        };
+        let payload = smallest(&self.weights, run_count(&self.weights) - unpacked);
+        let carried = tares
+            .checked_add(payload)
+            .ok_or_else(|| wrapped("billed weight"));
+        Ok(guard_output(floors.max(carried?), "billed weight")?)
+    }
+
+    /// `lowest_landed_cost`'s second key, the summed carrier charge in minor units.
+    ///
+    /// Every opened container is billed in exactly one bracket and pays its charge. A
+    /// container in bracket `(bound, charge)` weighs at most `bound`, so it is reachable only
+    /// when its floor is within it, carries at most `bound - tare` of payload (and its
+    /// `max_payload`), and at most as many instances as the lightest-first count under that
+    /// payload, its usable volume and `max_items`. Three relaxations of that assignment hold,
+    /// and the largest is the bound: the cheapest reachable charge per container over `opened`
+    /// containers; the least cost covering the placed weight; the least cost covering the
+    /// placed count. Prices need not rise with weight, which is why a bracket is chosen rather
+    /// than read off the floor. A type no bracket prices offers nothing: a packing that opens
+    /// one is refused, never returned. `O(c b log t + c b log(c b))`.
+    fn landed_charge_bound(
+        &self,
+        billings: &[Billing],
+        unpacked: i128,
+        opened: i128,
+    ) -> Result<i128, Withheld> {
+        let placed = run_count(&self.weights) - unpacked;
+        if opened == 0 || placed == 0 {
+            return Ok(0);
+        }
+        let payload_prefix = Prefix::of(&self.weights);
+        let volume_prefix = (!self.shrinks).then(|| Prefix::of(&self.volumes));
+        let mut cheapest = Vec::new();
+        let mut by_weight = Vec::new();
+        let mut by_items = Vec::new();
+        for (billing, container) in billings.iter().zip(&self.types) {
+            let mut least: Option<i128> = None;
+            for &(bound, charge) in &billing.brackets {
+                let Some(charge) = charge.filter(|_| billing.floor() <= bound) else {
+                    continue;
+                };
+                least = Some(least.map_or(charge, |current| current.min(charge)));
+                let carried = container.payload.map_or(bound - billing.tare, |payload| {
+                    payload.min(bound - billing.tare)
+                });
+                let mut count = payload_prefix.fit(carried);
+                if let Some(volumes) = &volume_prefix {
+                    count = count.min(volumes.fit(container.usable));
+                }
+                if let Some(slots) = container.max_items {
+                    count = count.min(slots);
+                }
+                by_weight.push((charge, carried, container.quantity));
+                by_items.push((charge, count, container.quantity));
+            }
+            if let Some(least) = least {
+                cheapest.push((least, container.quantity));
+            }
+        }
+        let terms = [
+            least_of_inventory(cheapest.into_iter(), opened, "landed charge")?,
+            cover(by_weight, smallest(&self.weights, placed))?,
+            cover(by_items, placed)?,
+        ];
+        let mut bound = 0;
+        for term in terms {
+            bound = bound.max(term.ok_or(Withheld::Unpriceable)?);
+        }
+        Ok(guard_output(bound, "landed charge")?)
     }
 }
 
@@ -464,25 +676,160 @@ fn container_bound(
 /// building it: `O(c log c)` rather than the `O(c · L1 log(c · L1))` of materialising up to
 /// `L1` copies of every type and sorting those (finding F6).
 fn cost_bound(containers: &[ContainerType], opened: i128) -> Result<i128, BoundOverflow> {
-    let mut by_cost: Vec<&ContainerType> = containers.iter().collect();
-    by_cost.sort_unstable_by_key(|container| container.cost_minor);
-    let mut needed = opened;
+    let costs = containers.iter().map(|c| (c.cost_minor, c.quantity));
+    let (total, _) = least_of(costs, opened, "opening cost")?;
+    guard(total, "opening cost")
+}
+
+/// The sum of the `count` smallest of `{value repeated quantity}`, with how many the
+/// inventory was short of `count`. Sorting the types and taking `min(quantity, still needed)`
+/// of each is `L2`'s rule, `O(c log c)`, without building the multiset.
+fn least_of(
+    values: impl Iterator<Item = (i128, Option<i128>)>,
+    count: i128,
+    quantity: &str,
+) -> Result<(i128, i128), BoundOverflow> {
+    let mut sorted: Vec<(i128, Option<i128>)> = values.collect();
+    sorted.sort_unstable_by_key(|&(value, _)| value);
+    let mut needed = count;
     let mut total: i128 = 0;
-    for container in by_cost {
+    for (value, available) in sorted {
         if needed <= 0 {
             break;
         }
-        let taken = container
-            .quantity
-            .map_or(needed, |quantity| quantity.min(needed));
-        total = container
-            .cost_minor
+        let taken = available.map_or(needed, |available| available.min(needed));
+        total = value
             .checked_mul(taken)
             .and_then(|product| total.checked_add(product))
-            .ok_or_else(|| wrapped("opening cost"))?;
+            .ok_or_else(|| wrapped(quantity))?;
         needed -= taken;
     }
-    guard(total, "opening cost")
+    Ok((total, needed.max(0)))
+}
+
+/// `least_of`, or `None` when the inventory holds fewer than `count`.
+fn least_of_inventory(
+    values: impl Iterator<Item = (i128, Option<i128>)>,
+    count: i128,
+    quantity: &str,
+) -> Result<Option<i128>, BoundOverflow> {
+    let (total, short) = least_of(values, count, quantity)?;
+    Ok((short == 0).then_some(total))
+}
+
+/// Runs with their running totals, so how many of the smallest fit under a capacity is one
+/// binary search, `O(log t)` per question, rather than a walk.
+struct Prefix {
+    /// `(value, summed value through this run, instances through this run)`.
+    runs: Vec<(i128, i128, i128)>,
+}
+
+impl Prefix {
+    /// Sums stay inside `MAX_BOUND_SUM`, which the predicate checked before any key is read.
+    fn of(ascending: &[(i128, i128)]) -> Self {
+        let (mut sum, mut count) = (0, 0);
+        let runs = ascending
+            .iter()
+            .map(|&(value, available)| {
+                sum += value * available;
+                count += available;
+                (value, sum, count)
+            })
+            .collect();
+        Self { runs }
+    }
+
+    /// `fit` by binary search: the whole runs whose running sum stays within `capacity`, and
+    /// as much of the next as the rest of it holds.
+    fn fit(&self, capacity: i128) -> i128 {
+        if capacity < 0 {
+            return 0;
+        }
+        let whole = self.runs.partition_point(|&(_, sum, _)| sum <= capacity);
+        let (used, taken) = whole
+            .checked_sub(1)
+            .map_or((0, 0), |last| (self.runs[last].1, self.runs[last].2));
+        let Some(&(value, _, through)) = self.runs.get(whole) else {
+            return taken;
+        };
+        // The run past the capacity has a positive value: a run of zeros adds nothing.
+        let room = ((capacity - used) / value).clamp(0, through - taken);
+        taken + room
+    }
+}
+
+/// The least cost covering `need` units from `(cost, capacity, quantity)` offers, taken
+/// fractionally and rounded up, or `None` when the offers cannot cover it.
+///
+/// A fractional covering problem with one constraint is solved exactly by taking offers in
+/// order of cost per unit. Only the last offer is taken in part, so the cost is an integer
+/// plus one ceiling and no fraction is carried. Offers of equal cost per unit give the same
+/// total in either order, so the order needs no tie-break. Each offer is limited by its
+/// type's whole inventory, which only weakens the bound. Costs and capacities are
+/// non-negative, as admission holds them.
+fn cover(
+    offers: Vec<(i128, i128, Option<i128>)>,
+    need: i128,
+) -> Result<Option<i128>, BoundOverflow> {
+    if need <= 0 {
+        return Ok(Some(0));
+    }
+    let mut ranked: Vec<_> = offers
+        .into_iter()
+        .filter(|&(_, capacity, _)| capacity > 0)
+        .collect();
+    ranked.sort_by(|a, b| per_unit_order(a.0, a.1, b.0, b.1));
+    let (mut total, mut need) = (0i128, need);
+    for (cost, capacity, quantity) in ranked {
+        // A product past `i128` is past any need the predicate admitted.
+        let covers = quantity.is_none_or(|quantity| {
+            quantity
+                .checked_mul(capacity)
+                .is_none_or(|held| held >= need)
+        });
+        let Some(quantity) = quantity.filter(|_| !covers) else {
+            let last = cost
+                .checked_mul(need)
+                .map(|product| ceil_div(product, capacity))
+                .and_then(|last| total.checked_add(last))
+                .ok_or_else(|| wrapped("landed charge"))?;
+            return Ok(Some(last));
+        };
+        total = cost
+            .checked_mul(quantity)
+            .and_then(|product| total.checked_add(product))
+            .ok_or_else(|| wrapped("landed charge"))?;
+        need -= capacity * quantity;
+    }
+    Ok(None)
+}
+
+/// `a_cost / a_capacity` against `b_cost / b_capacity`, exactly and without a product that
+/// could wrap: compare the integer parts, then the reciprocals of the remainders, as Euclid's
+/// algorithm does. Every argument is non-negative and both capacities positive.
+fn per_unit_order(
+    mut a_cost: i128,
+    mut a_capacity: i128,
+    mut b_cost: i128,
+    mut b_capacity: i128,
+) -> Ordering {
+    loop {
+        let (a_whole, a_rest) = (a_cost / a_capacity, a_cost % a_capacity);
+        let (b_whole, b_rest) = (b_cost / b_capacity, b_cost % b_capacity);
+        if a_whole != b_whole {
+            return a_whole.cmp(&b_whole);
+        }
+        match (a_rest, b_rest) {
+            (0, 0) => return Ordering::Equal,
+            (0, _) => return Ordering::Less,
+            (_, 0) => return Ordering::Greater,
+            // a_rest / a_capacity < b_rest / b_capacity exactly when
+            // b_capacity / b_rest < a_capacity / a_rest.
+            _ => {
+                (a_cost, a_capacity, b_cost, b_capacity) = (b_capacity, b_rest, a_capacity, a_rest);
+            }
+        }
+    }
 }
 
 /// `L3`: the fill is largest when every container is the smallest available and holds the
@@ -836,6 +1183,7 @@ mod tests {
             assert_eq!(computed.ok(), expected, "edge {:?}", edge["name"]);
             assert_objectives_match(edge, &instances, &containers);
         }
+        billed_cases_match(&document);
     }
 
     /// Every covered objective's vector, `null` where a ceiling withholds it.
@@ -849,7 +1197,7 @@ mod tests {
         for (objective, vector) in objectives {
             let order = objective_order(objective).expect("a covered objective");
             let computed = Inputs::of_reduced(instances, containers)
-                .objective_vector(&order)
+                .objective_vector(&order, &[])
                 .ok();
             let expected = vector.as_array().map(|values| {
                 values
@@ -974,10 +1322,428 @@ mod tests {
         assert_eq!(for_request(&request), Some(vec![0, 5, 1, 3, 500_000]));
         request.config.objective = "maximum_volume".into();
         assert_eq!(for_request(&request), Some(vec![0, 0, 1, 3, 500_000]));
-        for uncovered in ["shipping_cost", "lowest_landed_cost"] {
-            request.config.objective = uncovered.into();
-            assert_eq!(for_request(&request), None, "{uncovered}");
+        // The billed key needs the configuration's divisor; without one there is no number to
+        // bound, and admission refuses such a request before it gets here.
+        for billed in ["shipping_cost", "lowest_landed_cost"] {
+            request.config.objective = billed.into();
+            assert_eq!(for_request(&request), None, "{billed}");
         }
+        request.config.dimensional_weight_divisor = Some(139);
+        request.config.objective = "shipping_cost".into();
+        assert_eq!(for_request(&request), Some(vec![0, 0, 1, 500_000, 500_000]));
+        // No rate table prices the one box a placement must open.
+        request.config.objective = "lowest_landed_cost".into();
+        assert_eq!(for_request(&request), None);
+    }
+
+    /// Every billed fixture's vector, as Python states it. Deriving what each
+    /// container bills from a request is asserted end to end below; the scene holds the
+    /// arithmetic over the billed numbers.
+    fn billed_cases_match(document: &serde_json::Value) {
+        let cases = document["billed"].as_array().expect("billed cases");
+        assert!(!cases.is_empty(), "the billed objectives are not optional");
+        for case in cases {
+            let (instances, containers) = scene_inputs(case);
+            let billings: Vec<Billing> = case["containers"]
+                .as_array()
+                .expect("containers")
+                .iter()
+                .map(|raw| Billing {
+                    tare: raw["tare"].as_i64().expect("tare ticks").into(),
+                    dimensional: decimal(&raw["dimensional"]),
+                    brackets: raw["brackets"]
+                        .as_array()
+                        .expect("brackets")
+                        .iter()
+                        .map(|pair| (decimal(&pair[0]), pair[1].as_i64().map(i128::from)))
+                        .collect(),
+                })
+                .collect();
+            let objective = case["objective"].as_str().expect("objective");
+            let order = objective_order(objective).expect("a billed objective");
+            let computed = Inputs::of_reduced(&instances, &containers)
+                .objective_vector(&order, &billings)
+                .ok();
+            let expected = case["vector"].as_array().map(|values| {
+                values
+                    .iter()
+                    .map(|value| i128::from(value.as_i64().expect("integer bound")))
+                    .collect::<Vec<_>>()
+            });
+            let fixture = &case["fixture"];
+            assert_eq!(computed, expected, "{objective} diverges on {fixture}");
+        }
+    }
+
+    fn billed(objective: &str, containers: serde_json::Value, items: serde_json::Value) -> Value {
+        let request = serde_json::json!({
+            "items": items, "containers": containers,
+            "configuration": {"objective": objective, "dimensional_weight_divisor": 5000,
+                              "dimensional_weight_length_unit": "cm",
+                              "dimensional_weight_weight_unit": "kg",
+                              "solver_profile": "exact_small"}});
+        let output = crate::pack_json(&request.to_string()).expect("a packable request");
+        serde_json::from_str(&output).expect("a JSON result")
+    }
+
+    fn brick(quantity: u64, grams: u64) -> Value {
+        serde_json::json!({"id": "brick", "quantity": quantity, "weight": format!("{grams} g"),
+                           "dimensions": {"length": "100", "width": "100", "height": "100"}})
+    }
+
+    const TICKS_PER_G: i64 = crate::units::Weight::TICKS_PER_G;
+
+    /// A 200 mm by 100 mm by 100 mm box at divisor 5000 cm/kg is 0.4 kg dimensional; two 1 kg
+    /// bricks and a 300 g tare bill 2.3 kg actual, so the bound is the actual weight, and
+    /// attained.
+    #[test]
+    fn shipping_cost_bills_at_least_the_floor_and_at_least_tare_plus_payload() {
+        let result = billed(
+            "shipping_cost",
+            serde_json::json!([{"id": "box", "tare_weight": "300 g",
+                "inner_dimensions": {"length": "200", "width": "100", "height": "100"}}]),
+            serde_json::json!([brick(2, 1000)]),
+        );
+        let bound = &result["optimality"]["lower_bound"];
+        assert_eq!(bound[0], 0);
+        assert_eq!(bound[1], 2300 * TICKS_PER_G);
+        assert_eq!(result["status"], "optimal");
+    }
+
+    /// A 400 mm cube is 12.8 kg dimensional at 5000 cm/kg, above one light brick and its tare.
+    #[test]
+    fn shipping_cost_takes_the_dimensional_floor_when_the_box_is_bulky() {
+        let result = billed(
+            "shipping_cost",
+            serde_json::json!([{"id": "bulky",
+                "inner_dimensions": {"length": "400", "width": "400", "height": "400"}}]),
+            serde_json::json!([brick(1, 100)]),
+        );
+        assert_eq!(result["optimality"]["lower_bound"][1], 12_800 * TICKS_PER_G);
+    }
+
+    /// Two 1000 g bricks cannot share a 1500 g bracket, so two containers pay it twice: the
+    /// item cover says 200, which the weight cover alone (134) and the count term (100) miss.
+    #[test]
+    fn landed_cost_sees_that_two_bricks_cannot_share_a_bracket() {
+        let result = billed(
+            "lowest_landed_cost",
+            serde_json::json!([
+                {"id": "snug-dear",
+                 "inner_dimensions": {"length": "200", "width": "100", "height": "100"},
+                 "rate_table": {"weight_brackets_g": [20000], "prices_minor": [5000]}},
+                {"id": "unit-cheap",
+                 "inner_dimensions": {"length": "100", "width": "100", "height": "100"},
+                 "rate_table": {"weight_brackets_g": [1500], "prices_minor": [100]}}]),
+            serde_json::json!([brick(2, 1000)]),
+        );
+        let bound = &result["optimality"]["lower_bound"];
+        assert_eq!((&bound[0], &bound[1]), (&Value::from(0), &Value::from(200)));
+        // This engine is not held to Python's placements, only to a bound no score falls below.
+        assert!(result["score"][1].as_i64().expect("charge") >= 200);
+    }
+
+    fn priced(brackets: Vec<(i128, Option<i128>)>, dimensional: i128) -> Billing {
+        Billing {
+            tare: 0,
+            dimensional,
+            brackets,
+        }
+    }
+
+    fn one_box(usable: i128, quantity: Option<i128>) -> ContainerType {
+        ContainerType {
+            usable,
+            inner: usable,
+            base_area: 1,
+            height: 1,
+            payload: None,
+            max_items: None,
+            quantity,
+            cost_minor: 0,
+        }
+    }
+
+    fn weighed(weights: &[i128]) -> Inputs {
+        let instances: Vec<Instance> = weights
+            .iter()
+            .map(|&weight| Instance {
+                volume: 1,
+                weight,
+                shrinks: false,
+                value: 0,
+            })
+            .collect();
+        Inputs::of_reduced(&instances, &[])
+    }
+
+    /// A promotional dip: the 2 kg bracket is dearer than the 5 kg one. A load that could be
+    /// billed in either is bounded by the cheaper, since prices need not rise with weight.
+    #[test]
+    fn landed_cost_reads_the_cheapest_bracket_a_floor_can_reach_not_the_floors_own() {
+        let g = i128::from(TICKS_PER_G);
+        let inputs = Inputs {
+            types: vec![one_box(10, None)],
+            ..weighed(&[1000 * g])
+        };
+        let billing = priced(vec![(2000 * g, Some(700)), (5000 * g, Some(400))], 0);
+        assert_eq!(inputs.landed_charge_bound(&[billing], 0, 1), Ok(400));
+    }
+
+    /// `max(price, minimum)` then the ceiling surcharge, the rate table's own order.
+    #[test]
+    fn landed_cost_applies_the_minimum_charge_and_the_surcharge_to_every_bracket() {
+        use crate::geometry::Dimensions;
+        use crate::units::Length;
+        let mut container = Container::new(
+            "c",
+            Dimensions {
+                length: Length(100),
+                width: Length(100),
+                height: Length(100),
+            },
+        );
+        container.rate_table = Some(crate::model::RateTable {
+            weight_brackets_g: vec![1000, 2000],
+            prices_minor: vec![100, 900],
+            minimum_charge_minor: 300,
+            fuel_surcharge_permille: 85,
+            currency: None,
+        });
+        let g = i128::from(TICKS_PER_G);
+        assert_eq!(
+            brackets(&container),
+            vec![(1000 * g, Some(326)), (2000 * g, Some(977))]
+        );
+    }
+
+    /// A floor above every bracket cannot be priced, and a packing that opens it is refused
+    /// rather than returned, so with nothing else to open no statement is made.
+    #[test]
+    fn a_type_no_bracket_can_price_is_left_out_and_none_left_withholds_the_bound() {
+        let inputs = Inputs {
+            types: vec![one_box(10, None)],
+            ..weighed(&[1])
+        };
+        let unpriceable = priced(vec![(5, Some(100))], 10);
+        assert_eq!(
+            inputs.landed_charge_bound(&[unpriceable], 0, 1),
+            Err(Withheld::Unpriceable)
+        );
+    }
+
+    /// Greedy by cost per unit is exact for one covering constraint; inventory caps an offer.
+    #[test]
+    fn the_fractional_cover_takes_cost_per_unit_order_and_rounds_only_once() {
+        // 7 x 10/3, rounded up; then one 3-unit offer and 4 x 4; then nothing covers.
+        assert_eq!(cover(vec![(10, 3, None), (4, 1, None)], 7), Ok(Some(24)));
+        assert_eq!(cover(vec![(10, 3, Some(1)), (4, 1, None)], 7), Ok(Some(26)));
+        assert_eq!(cover(vec![(10, 3, Some(1))], 7), Ok(None));
+        assert_eq!(cover(vec![(0, 5, None)], 7), Ok(Some(0)));
+        // A cross-multiplication would wrap `i128` here; the comparison does not.
+        let wide = i128::MAX / 3;
+        assert_eq!(per_unit_order(wide, 7, wide - 1, 7), Ordering::Greater);
+        assert_eq!(per_unit_order(2, wide, 1, wide), Ordering::Greater);
+        assert_eq!(per_unit_order(10, 4, 5, 2), Ordering::Equal);
+        assert_eq!(per_unit_order(1, 3, 1, 2), Ordering::Less);
+    }
+
+    #[test]
+    fn the_shipping_bound_is_withheld_without_enough_inventory_to_open() {
+        let inputs = Inputs {
+            types: vec![one_box(10, Some(1))],
+            ..weighed(&[1, 1])
+        };
+        assert_eq!(
+            inputs.billed_weight_bound(&[priced(Vec::new(), 5)], 0, 2),
+            Err(Withheld::Unpriceable)
+        );
+    }
+
+    /// The prefix search answers what the run walk answers, zero-value runs and a run taken
+    /// part-way included.
+    #[test]
+    fn the_prefix_search_agrees_with_the_walk() {
+        let runs = [(0, 2), (3, 2), (5, 3)];
+        let prefix = Prefix::of(&runs);
+        for capacity in 0..30 {
+            assert_eq!(
+                prefix.fit(capacity),
+                fit(&runs, Some(capacity)),
+                "capacity {capacity}"
+            );
+        }
+        assert_eq!(prefix.fit(-1), 0);
+    }
+
+    /// A type whose floor no bracket reaches offers nothing; a payload cap and a slot limit
+    /// bound what a bracket carries; a nesting item drops the volume count. The engine's
+    /// stated bound is the one the validator recomputes.
+    #[test]
+    fn the_landed_bound_reads_payload_slot_and_shrinking_limits_alike_in_engine_and_validator() {
+        let mut request = landed_request(
+            serde_json::json!([
+                {"id": "bulky",
+                 "inner_dimensions": {"length": "500", "width": "500", "height": "500"},
+                 "rate_table": {"weight_brackets_g": [1000], "prices_minor": [10]}},
+                {"id": "capped", "max_payload": "1500 g", "max_items": 1,
+                 "inner_dimensions": {"length": "200", "width": "200", "height": "200"},
+                 "rate_table": {"weight_brackets_g": [3000, 9000], "prices_minor": [300, 200]}}]),
+            serde_json::json!([{"id": "cup", "quantity": 2, "weight": "1000 g",
+                "nesting_height": "10",
+                "dimensions": {"length": "100", "width": "100", "height": "50"}}]),
+        );
+        // `balanced` rather than Python's `exact_small`: this engine's exact search ends on
+        // the unpriceable box here and refuses the pack, which says nothing about the
+        // bound.
+        request["configuration"]["solver_profile"] = "balanced".into();
+        let result = packed_with_issues(&request);
+        assert_eq!(result["optimality"]["lower_bound"][1], 400);
+    }
+
+    /// A payload no instance fits places nothing, opens nothing and bills nothing.
+    #[test]
+    fn nothing_placeable_bounds_the_billed_keys_at_zero() {
+        let mut request = landed_request(
+            serde_json::json!([{"id": "tiny", "quantity": 1, "max_payload": "1 g",
+                "inner_dimensions": {"length": "200", "width": "200", "height": "200"},
+                "rate_table": {"weight_brackets_g": [3000], "prices_minor": [300]}}]),
+            serde_json::json!([{"id": "brick", "weight": "1000 g",
+                "dimensions": {"length": "100", "width": "100", "height": "100"}}]),
+        );
+        for objective in ["lowest_landed_cost", "shipping_cost"] {
+            request["configuration"]["objective"] = objective.into();
+            let result = packed_with_issues(&request);
+            let bound = &result["optimality"]["lower_bound"];
+            assert_eq!((&bound[0], &bound[1]), (&Value::from(1), &Value::from(0)));
+        }
+        let inputs = Inputs {
+            types: vec![one_box(10, None)],
+            ..weighed(&[1])
+        };
+        assert_eq!(
+            inputs.billed_weight_bound(&[priced(Vec::new(), 5)], 1, 0),
+            Ok(0)
+        );
+        assert_eq!(inputs.landed_charge_bound(&[], 1, 0), Ok(0));
+    }
+
+    /// Nothing the inventory lists can price the one box a brick must open, so no bound is
+    /// stated; the pack itself is refused rather than priced at a number the carrier never
+    /// published.
+    #[test]
+    fn a_landed_request_nothing_can_price_states_no_bound() {
+        let request = landed_request(
+            serde_json::json!([{"id": "bulky",
+                "inner_dimensions": {"length": "500", "width": "500", "height": "500"},
+                "rate_table": {"weight_brackets_g": [1000], "prices_minor": [10]}}]),
+            serde_json::json!([{"id": "brick", "weight": "100 g",
+                "dimensions": {"length": "100", "width": "100", "height": "100"}}]),
+        );
+        let parsed = crate::api::request_from_json(&request).expect("admitted");
+        assert_eq!(for_request(&parsed), None);
+        assert!(crate::pack_json(&request.to_string()).is_err());
+    }
+
+    /// The limits each billed key's arithmetic refuses past: a sum that would wrap, a key
+    /// past the portable ceiling, an inventory too short, and a cover that cannot be paid.
+    #[test]
+    fn the_billed_keys_are_withheld_rather_than_wrapped() {
+        let inputs = Inputs {
+            types: vec![one_box(10, None)],
+            ..weighed(&[1])
+        };
+        let floor = |dimensional| [priced(Vec::new(), dimensional)];
+        assert_eq!(
+            inputs.billed_weight_bound(&floor(i128::MAX), 0, 2),
+            Err(Withheld::Overflow)
+        );
+        assert_eq!(
+            inputs.billed_weight_bound(&floor(MAX_BOUND_VALUE + 1), 0, 1),
+            Err(Withheld::Overflow)
+        );
+        let heavy_tare = [Billing {
+            tare: i128::MAX,
+            ..priced(Vec::new(), 0)
+        }];
+        assert_eq!(
+            inputs.billed_weight_bound(&heavy_tare, 0, 1),
+            Err(Withheld::Overflow)
+        );
+        // Through the vector: a billed order still refuses what the five bounds refuse.
+        let vast = Instance {
+            volume: MAX_BOUND_SUM,
+            weight: 1,
+            shrinks: false,
+            value: 0,
+        };
+        let order = objective_order("shipping_cost").expect("billed");
+        assert_eq!(
+            Inputs::of_reduced(&[vast; 2], &[one_box(1, None)]).objective_vector(&order, &[]),
+            Err(Withheld::Overflow)
+        );
+        assert_eq!(objective_order("custom"), None);
+
+        // A cheap one-slot box and a dear one: the cheap inventory runs out before the count.
+        let g = i128::from(TICKS_PER_G);
+        let capped = ContainerType {
+            payload: Some(500 * g),
+            max_items: Some(1),
+            ..one_box(10, Some(1))
+        };
+        let two = Inputs {
+            types: vec![capped],
+            ..weighed(&[100 * g, 100 * g])
+        };
+        let cheap = [priced(vec![(1000 * g, Some(5)), (2000 * g, None)], 0)];
+        assert_eq!(
+            two.landed_charge_bound(&cheap, 0, 2),
+            Err(Withheld::Unpriceable)
+        );
+        let dear = [priced(vec![(1000 * g, Some(MAX_BOUND_VALUE))], 0)];
+        let roomy = Inputs {
+            types: vec![one_box(10, None)],
+            ..weighed(&[100 * g, 100 * g])
+        };
+        assert_eq!(
+            roomy.landed_charge_bound(&dear, 0, 2),
+            Err(Withheld::Overflow)
+        );
+
+        assert_eq!(cover(vec![(1, 1, None)], 0), Ok(Some(0)));
+        assert!(cover(vec![(i128::MAX, 1, Some(2))], 5).is_err());
+        assert!(cover(vec![(i128::MAX / 2, 1, None)], 3).is_err());
+        assert_eq!(per_unit_order(1, 1, 3, 2), Ordering::Less);
+        assert_eq!(per_unit_order(3, 2, 1, 1), Ordering::Greater);
+        let bare = Container::new(
+            "bare",
+            crate::geometry::Dimensions {
+                length: crate::units::Length(10),
+                width: crate::units::Length(10),
+                height: crate::units::Length(10),
+            },
+        );
+        assert_eq!(brackets(&bare), Vec::new());
+    }
+
+    fn landed_request(containers: Value, items: Value) -> Value {
+        serde_json::json!({
+            "items": items, "containers": containers,
+            "configuration": {"objective": "lowest_landed_cost",
+                              "dimensional_weight_divisor": 5000,
+                              "dimensional_weight_length_unit": "cm",
+                              "dimensional_weight_weight_unit": "kg",
+                              "solver_profile": "exact_small"}})
+    }
+
+    /// The packed result, held to the validator's recomputed bound: no issue is reported.
+    fn packed_with_issues(request: &Value) -> Value {
+        let text = request.to_string();
+        let output = crate::pack_json(&text).expect("a packable request");
+        let issues = crate::validate_json(&text, &output).expect("judged");
+        let codes: Vec<&str> = issues.iter().map(|issue| issue.code.as_str()).collect();
+        assert_eq!(codes, Vec::<&str>::new());
+        serde_json::from_str(&output).expect("a JSON result")
     }
 
     /// The oracle's hand-checked objective-only keys, each in its own worked
@@ -1002,7 +1768,7 @@ mod tests {
         };
         let stated = |instances: &[Instance], containers: &[ContainerType], objective: &str| {
             Inputs::of_reduced(instances, containers)
-                .objective_vector(&objective_order(objective).expect("covered"))
+                .objective_vector(&objective_order(objective).expect("covered"), &[])
                 .ok()
         };
         // One of three 600-volume items fits: the two cheapest forgo 10 + 50, the one placed

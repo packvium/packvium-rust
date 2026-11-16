@@ -199,7 +199,7 @@ fn pack_blocks(
                 container
                     .rate_table
                     .as_ref()
-                    .and_then(|table| table.charge_minor(RateTable::grams(billed as i64)))
+                    .and_then(|table| table.charge_minor(RateTable::grams_saturating(billed)))
                     .map_or(i128::MAX, i128::from)
             } else {
                 0

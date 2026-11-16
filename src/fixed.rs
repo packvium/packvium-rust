@@ -15,10 +15,10 @@ use crate::canonical_json::{MAX_EXACT_MAGNITUDE, json_integer, json_spelling, sp
 use crate::contact_graph::ContactGraph;
 use crate::error::{PackError, PackResult, RequestError};
 use crate::geometry::{Point, Rotation, ShapeType};
+use crate::loads::calculate_top_loads;
 use crate::model::{placement_id, *};
 use crate::pallet_overhang::{Deck, floor_support};
 use crate::request_errors::orientation_refusal;
-use crate::solvers::calculate_top_loads;
 use crate::units::{MeasureKind, Weight, measure_ticks};
 use crate::validation::IndependentValidator;
 use serde_json::{Map, Value};

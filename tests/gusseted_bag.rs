@@ -5,9 +5,9 @@
 //! are compared across engines.
 
 use packvium_core::{
-    Container, DeformableBoundary, Dimensions, IndependentValidator, Item, ItemInstance, Length,
-    PackError, PackedContainer, PackingConfig, PackingRequest, Placement, Point, Rotation, Weight,
-    pack_json, pack_request, validate_json,
+    BagOrientation, Container, DeformableBoundary, Dimensions, IndependentValidator, Item,
+    ItemInstance, Length, PackError, PackedContainer, PackingConfig, PackingRequest, Placement,
+    Point, Rotation, Weight, pack_json, pack_request, validate_json,
 };
 use serde_json::{Value, json};
 
@@ -24,6 +24,8 @@ fn mm(length: i64, width: i64, height: i64) -> Dimensions {
 fn gusseted(depth_ticks: i64) -> Option<DeformableBoundary> {
     Some(DeformableBoundary::GussetedBag {
         side_gusset_depth: Length(depth_ticks),
+        bottom_gusset_depth: Length(0),
+        orientation: BagOrientation::Flat,
     })
 }
 

@@ -204,7 +204,14 @@ fn parse_tariff(value: &Value, path: &str, carrier_id: &str, service_id: &str) -
     )?;
     let zones_path = format!("{path}.cost_per_dimensional_kg_minor");
     let mut cost_per_dimensional_kg_minor = BTreeMap::new();
-    for (zone, cost) in object(&fields["cost_per_dimensional_kg_minor"], &zones_path)? {
+    // Code-point order of the key (UTF-8 byte order), so the first refusal never depends on the
+    // map's own iteration order or on another language's.
+    let mut zones: Vec<(&String, &Value)> =
+        object(&fields["cost_per_dimensional_kg_minor"], &zones_path)?
+            .iter()
+            .collect();
+    zones.sort_unstable_by(|left, right| left.0.cmp(right.0));
+    for (zone, cost) in zones {
         let cost = integer(cost, &format!("{zones_path}[{zone}]"))?;
         if cost < 0 {
             return fail(
