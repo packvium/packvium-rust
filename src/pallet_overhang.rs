@@ -12,7 +12,9 @@
 //! The packed pallet is billed and handed up at the size it reached. Exact integers throughout.
 
 use crate::geometry::{Aabb, Dimensions, Point};
-use crate::model::{Container, Placement, required_support_area, scaled_support_ratio};
+use crate::model::{
+    Container, DeformableBoundary, Placement, required_support_area, scaled_support_ratio,
+};
 use crate::support_polygon::centre_of_gravity_supported;
 use crate::units::Length;
 
@@ -182,9 +184,35 @@ pub(crate) fn floor_support(deck: Option<Deck>, box_: Aabb) -> (i128, f64) {
     }
 }
 
-/// The container every solver packs: itself without a limit, else the widened frame
-/// carrying its deck. The frame states no limit, so a second call returns it unchanged.
+/// Whether `solving_frame` changes this container: a standing bag not yet turned, or a
+/// pallet with a limit. `O(1)`.
+pub(crate) fn needs_solving_frame(container: &Container) -> bool {
+    stands_unturned(container) || container.pallet_overhang_limit.is_some()
+}
+
+fn stands_unturned(container: &Container) -> bool {
+    !container.upright_frame
+        && container
+            .deformable_boundary
+            .is_some_and(DeformableBoundary::is_standing)
+}
+
+/// The container every solver packs: a standing bag turned to its `W x H x L` frame
+///, a pallet with a limit widened to the frame carrying its deck, else itself. A
+/// frame is marked as one, so a second call returns it unchanged.
 pub(crate) fn solving_frame(container: &Container) -> Container {
+    if stands_unturned(container) {
+        let declared = container.inner_dimensions;
+        return Container {
+            inner_dimensions: Dimensions {
+                length: declared.width,
+                width: declared.height,
+                height: declared.length,
+            },
+            upright_frame: true,
+            ..container.clone()
+        };
+    }
     let Some(limit) = container.pallet_overhang_limit else {
         return container.clone();
     };

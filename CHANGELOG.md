@@ -4,6 +4,46 @@ What changed in `packvium` on crates.io, release by release. The format follows
 [Keep a Changelog](https://keepachangelog.com/1.1.0/) and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.11.0]
+
+Bottom gussets and standing pouches, a certified bound for the shipping objectives, one money
+ceiling, and one measure grammar.
+
+### Added
+
+- **`bottom_gusset_depth` and `orientation`** on `DeformableBoundary::GussetedBag`, with the new
+  `BagOrientation { Flat, Standing }`. `Container` gains `upright_frame`. A struct literal or a
+  full pattern must name the new fields.
+- **`optimality.lower_bound` and the gap under `shipping_cost` and `lowest_landed_cost`**
+  (`bounds.rs`); the validator checks them.
+- **`examples/checkout.rs` and `examples/fulfilment.rs`.**
+
+### Changed
+
+- **One money ceiling, 2^53 − 1:** a `rate_table` priced above it at its top bracket is refused
+  at admission, and a quote refuses an amount above it where it used to answer up to `i64::MAX`
+  and wrap past it. `RatingRejection::AmountOutOfRange` became `AmountAboveCeiling(i128)`.
+- **Measures follow the shared grammar:** upper-case units (`"1 G"`) are read; `"100 millimeters"`
+  and `"1 -1/2"` are refused; `"-0 1/2"` is minus a half, not plus. `hull_vertices` holds at most
+  32 points.
+- **`effort_budget` limits and `tag_limits` written as `1000.0`** are the integers they equal.
+
+### Fixed
+
+- **A billed weight past `i64` wrapped into the cheapest bracket,** and an overflowing landed cost
+  was reported as a weight past the last bracket.
+- **On wasm32, a JSON count of 2^32 truncated to 0** (`max_restarts`, `tag_limits`). It now
+  saturates.
+- **The result validator could panic** sorting a crafted result with mixed-type values.
+
+### Performance
+
+- **The contact graph no longer buckets every box with the largest:** 961,792 candidate checks
+  fall to 10,672 with one pallet-wide box among 4,000.
+- **The safe-removal search is no longer cubic.**
+- **The plan beam scores each plan 1.4–2.2 times less often.**
+- **The exact search's visited set is capped at 262,144 states.**
+
 ## [1.10.0]
 
 Pallets may overhang their deck, mailers may have gussets, a hull turns 24 ways, every

@@ -511,7 +511,7 @@ fn an_accessorial_with_no_charge_at_all_costs_nothing() {
         permille_of_base: None,
     };
 
-    assert_eq!(charge.charge_minor(100_000), 0);
+    assert_eq!(charge.charge_minor(100_000), Ok(0));
 }
 
 #[test]
@@ -795,4 +795,164 @@ fn object_comparisons_do_not_match_an_absent_context_field() {
     ] {
         assert!(!predicate(operator, json!({"a": null})).matches(&context(&[])));
     }
+}
+
+// ------------------------------------------------------------------- amount overflow
+
+const LARGE: i64 = 9_007_199_254_740_991;
+
+fn overflow_quote(accessorials: Value, requested: Value, fuel_permille: i64) -> String {
+    call(
+        json!({"tariffs": [{
+            "carrier_id": "acme", "service_id": "ground",
+            "versions": [{
+                "effective_at": 0, "dimensional_weight_divisor": 1,
+                "cost_per_dimensional_kg_minor": {"zone-a": LARGE},
+                "fuel_surcharge_permille": fuel_permille,
+                "accessorials": accessorials,
+            }],
+        }]}),
+        json!({"carrier_id": "acme", "service_id": "ground", "tariff_version": 1,
+               "zone": "zone-a", "actual_weight_g": LARGE, "volume_mm3": 1,
+               "requested_accessorials": requested}),
+    )
+}
+
+#[test]
+fn a_product_past_i64_is_a_malformed_request_not_a_wrapped_quote() {
+    // base = ceil(LARGE * LARGE / 1000) is already about 8e28, far past i64.
+    let error = quote_json(&overflow_quote(json!([]), json!([]), 0))
+        .expect_err("a base charge past i64 has no honest number");
+    assert_eq!(error.path, "request");
+}
+
+#[test]
+fn a_total_past_i64_is_a_malformed_request_not_a_wrapped_quote() {
+    let accessorials = json!([
+        {"accessorial_id": "a", "flat_charge_minor": i64::MAX},
+        {"accessorial_id": "b", "flat_charge_minor": i64::MAX},
+    ]);
+    let error = quote_json(&overflow_quote(accessorials, json!(["a", "b"]), 0))
+        .expect_err("an accessorial total past i64 has no honest number");
+    assert_eq!(error.path, "request");
+}
+
+#[test]
+fn an_in_range_accessorial_charge_overflow_is_checked_too() {
+    let charge = AccessorialCharge {
+        accessorial_id: "big".to_owned(),
+        flat_charge_minor: None,
+        permille_of_base: Some(i64::MAX),
+    };
+    let exact = i128::from(i64::MAX) * i128::from(i64::MAX) / 1000 + 1;
+    assert_eq!(
+        charge.charge_minor(i64::MAX),
+        Err(packvium_core::commerce::RatingRejection::AmountAboveCeiling(exact))
+    );
+}
+
+// ------------------------------------------------------------------- money ceiling (M2)
+
+const CEILING: i64 = 9_007_199_254_740_991;
+
+/// One tariff and one shipment, priced at `rate_per_kg` with the given fuel surcharge and
+/// accessorials (all requested). An `Err` is the input error's message, its path asserted.
+fn ceiling_quote(
+    rate_per_kg: i64,
+    fuel_permille: i64,
+    accessorials: Value,
+    weight_g: i64,
+    volume_mm3: i64,
+) -> Result<Value, String> {
+    let requested: Vec<Value> = accessorials
+        .as_array()
+        .expect("a list")
+        .iter()
+        .map(|entry| entry["accessorial_id"].clone())
+        .collect();
+    let input = call(
+        json!({"tariffs": [{
+            "carrier_id": "acme", "service_id": "ground",
+            "versions": [{
+                "effective_at": 0, "dimensional_weight_divisor": 1,
+                "cost_per_dimensional_kg_minor": {"zone-a": rate_per_kg},
+                "fuel_surcharge_permille": fuel_permille,
+                "accessorials": accessorials,
+            }],
+        }]}),
+        json!({"carrier_id": "acme", "service_id": "ground", "tariff_version": 1,
+               "zone": "zone-a", "actual_weight_g": weight_g, "volume_mm3": volume_mm3,
+               "requested_accessorials": requested}),
+    );
+    quote_json(&input)
+        .map(|answer| serde_json::from_str(&answer).expect("a JSON answer"))
+        .map_err(|error| {
+            assert_eq!(error.path, "request");
+            error.message
+        })
+}
+
+fn above_ceiling(amount: &str) -> String {
+    format!("quote amount {amount} is above 9007199254740991 and cannot be represented exactly")
+}
+
+#[test]
+fn a_quote_exactly_at_the_ceiling_is_answered() {
+    let answer = ceiling_quote(CEILING, 0, json!([]), 1000, 1).expect("at the ceiling");
+    assert_eq!(answer["quote"]["total_minor"], CEILING);
+    assert_eq!(answer["quote"]["base_charge_minor"], CEILING);
+}
+
+#[test]
+fn a_dimensional_weight_above_the_ceiling_refuses_the_quote() {
+    assert_eq!(
+        ceiling_quote(1, 0, json!([]), 1, CEILING + 1),
+        Err(above_ceiling("9007199254740992"))
+    );
+}
+
+#[test]
+fn a_billed_weight_above_the_ceiling_refuses_the_quote() {
+    assert_eq!(
+        ceiling_quote(0, 0, json!([]), CEILING + 1, 1),
+        Err(above_ceiling("9007199254740992"))
+    );
+}
+
+#[test]
+fn a_base_charge_above_the_ceiling_refuses_the_quote() {
+    assert_eq!(
+        ceiling_quote(CEILING + 1, 0, json!([]), 1000, 1),
+        Err(above_ceiling("9007199254740992"))
+    );
+}
+
+#[test]
+fn a_fuel_surcharge_above_the_ceiling_refuses_the_quote() {
+    // The base charge sits exactly at the ceiling; its surcharge is twice that.
+    assert_eq!(
+        ceiling_quote(CEILING, 2000, json!([]), 1000, 1),
+        Err(above_ceiling("18014398509481982"))
+    );
+}
+
+#[test]
+fn an_accessorial_above_the_ceiling_refuses_the_quote() {
+    let accessorials = json!([
+        {"accessorial_id": "a", "flat_charge_minor": CEILING},
+        {"accessorial_id": "b", "flat_charge_minor": CEILING + 1},
+    ]);
+    assert_eq!(
+        ceiling_quote(1000, 0, accessorials, 1000, 1),
+        Err(above_ceiling("9007199254740992"))
+    );
+}
+
+#[test]
+fn a_total_above_the_ceiling_refuses_the_quote_though_every_component_is_inside() {
+    // 6e15 base + 3.6e15 fuel = 9.6e15 > 2^53 - 1.
+    assert_eq!(
+        ceiling_quote(6_000_000_000_000_000, 600, json!([]), 1000, 1),
+        Err(above_ceiling("9600000000000000"))
+    );
 }

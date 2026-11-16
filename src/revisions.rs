@@ -936,6 +936,9 @@ fn check_artifact(
 
 const SIDES: [&str; 3] = ["length", "width", "height"];
 
+/// The largest price every engine can carry exactly: `2^53 - 1`, a JSON number's safe range.
+const MAX_SAFE_COST: i128 = 9_007_199_254_740_991;
+
 /// `request` with every made-to-measure box that holds a fixed placement made a stock container
 ///. The box was cut for the approved plan, so a replan cannot recut it: instance `n`
 /// of made-to-measure type `T` -- the `n`-th container of type `T` in the artifact, in result
@@ -1197,7 +1200,16 @@ fn stock_box(
     fields.insert("quantity".into(), json!(1));
     fields.insert("inner_dimensions".into(), tick_box(inner));
     fields.insert("outer_dimensions".into(), tick_box(outer));
-    // Past `i64` the price is past 2^53 - 1 too, so the canonical form refuses it either way.
+    // Revisions take the cut size from the artifact without re-admitting the request, so a
+    // box larger than the machine's declared size can price past 2^53 - 1 here (C-13).
+    if cost > MAX_SAFE_COST {
+        return refuse(
+            RevisionErrorCode::InvalidRevision,
+            format!(
+                "a made-to-measure container's cost_per_square_metre_minor prices the largest box above {MAX_SAFE_COST}"
+            ),
+        );
+    }
     fields.insert(
         "cost_minor".into(),
         json!(i64::try_from(cost).unwrap_or(i64::MAX)),

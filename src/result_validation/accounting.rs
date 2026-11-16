@@ -3,6 +3,7 @@
 use std::cmp::Ordering;
 
 use super::Issue;
+use super::container::girth_breach;
 use super::geometry::BOX_ROTATIONS;
 use super::json::{EMPTY_STR, Json, Ordered, Res};
 use super::num::{add, mul};
@@ -197,14 +198,12 @@ pub(crate) fn check_accounting(
 }
 
 /// Whether one envelope of this size fits the empty container: its frame and, for a bag, both
-/// girth sums with the envelope alone at the origin, the width one widened by a side gusset.
+/// loops of film with the envelope alone at the origin (`girth_breach`).
 pub(crate) fn fits_empty(container: &ContainerSpec, size: [i128; 3]) -> Res<bool> {
     if (0..3).any(|axis| size[axis] > container.inner[axis]) {
         return Ok(false);
     }
-    Ok(!container.flat_bag
-        || (add(size[0], size[2])? <= container.inner[0]
-            && add(size[1], size[2])? <= add(container.inner[1], container.side_gusset)?))
+    Ok(!container.flat_bag || girth_breach(container, size[0], size[1], size[2])?.is_none())
 }
 
 /// `any(_fits_empty(container, rotated envelope) for container ... for rotation ...)`,

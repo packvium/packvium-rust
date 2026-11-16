@@ -119,3 +119,31 @@ fn stocking_joins_types_and_leaves_unselected_malformed_geometry_unread() {
         "1"
     );
 }
+
+#[test]
+fn stocking_refuses_a_cut_box_priced_past_the_safe_integer_range() {
+    let request = json!({
+        "containers":[{"id":"machine","cost_minor":1,"made_to_measure":{"cost_per_square_metre_minor":9_000_000_000_000_000_i64}}],
+        "fixed_placements":[{"container_type":"machine"}]
+    });
+    let artifact = |ticks: &str| {
+        json!({
+            "work_order":{"containers":[{"container_type":"machine"}]},
+            "geometry":{"containers":[{"inner_dimensions":{"length":ticks,"width":ticks,"height":ticks}}]}
+        })
+        .to_string()
+    };
+    // 10 mm and 1 m cubes at the same rate: 5.4e12 prices fine, 5.4e16 passes 2^53 - 1.
+    let small = stock_cut_boxes_json(&request.to_string(), &artifact("160000"), 1).unwrap();
+    let stocked: Value = serde_json::from_str(&small).unwrap();
+    assert_eq!(
+        stocked["containers"][1]["cost_minor"],
+        5_400_000_000_001_i64
+    );
+    let error = stock_cut_boxes_json(&request.to_string(), &artifact("16000000"), 1).unwrap_err();
+    assert_eq!(error.code(), "invalid_revision");
+    assert_eq!(
+        error.message(),
+        "a made-to-measure container's cost_per_square_metre_minor prices the largest box above 9007199254740991"
+    );
+}

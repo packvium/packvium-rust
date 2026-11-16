@@ -11,6 +11,7 @@ use crate::canonical_json::{MAX_EXACT_MAGNITUDE, json_integer, json_spelling, sp
 use crate::error::RequestError;
 use crate::fixed::unknown_keys;
 use crate::geometry::Rotation;
+use crate::hull;
 use crate::made_to_measure::MadeToMeasure;
 use crate::units::{MeasureKind, Overflowed, measure_ticks, overflowed_measure};
 use serde_json::{Map, Value};
@@ -298,6 +299,7 @@ fn check_item(raw: &Value, at: &str, unit: &str) -> Checked {
     optional(item, "shape_type", at, |value, field| {
         one_of(value, field, &SHAPE_TYPES)
     })?;
+    optional(item, "hull_vertices", at, hull_vertex_count)?;
     for name in ITEM_BOOLEANS {
         optional(item, name, at, boolean)?;
     }
@@ -316,6 +318,18 @@ fn check_item(raw: &Value, at: &str, unit: &str) -> Checked {
                 "must allow at least one rotation after keep_upright",
             ));
         }
+    }
+    Ok(())
+}
+
+/// Only the count: the cap exists so no per-vertex work runs on an oversized hull. O(1).
+fn hull_vertex_count(value: &Value, field: &str) -> Checked {
+    if list(value, field)?.len() > hull::MAXIMUM_VERTICES {
+        return Err(RequestError::new(
+            "above_maximum",
+            field,
+            hull::TOO_MANY_VERTICES,
+        ));
     }
     Ok(())
 }
@@ -574,6 +588,17 @@ fn made_to_measure(
 /// The kinds `deformable_boundary` admits; `gusseted_bag` since 1.10.
 const DEFORMABLE_BOUNDARY_KINDS: [&str; 2] = ["flat_bag", GUSSETED_BAG];
 const GUSSETED_BAG: &str = "gusseted_bag";
+/// The keys a gusseted bag's boundary may carry (1.10 side gusset; 1.11 bottom gusset and
+/// orientation).
+const GUSSETED_BAG_FIELDS: [&str; 4] = [
+    "bottom_gusset_depth",
+    "kind",
+    "orientation",
+    "side_gusset_depth",
+];
+/// How a gusseted bag may be packed.
+const BAG_ORIENTATIONS: [&str; 2] = ["flat", STANDING];
+const STANDING: &str = "standing";
 /// Container fields a flat bag refuses, in reporting order (docs/DEFORMABLE-CONTAINERS.md).
 const BAG_EXCLUSIONS: [&str; 8] = [
     "obstacles",
@@ -586,8 +611,8 @@ const BAG_EXCLUSIONS: [&str; 8] = [
     "pallet_overhang_limit",
 ];
 
-/// The boundary object top to bottom -- kind, unknown keys, the gusset -- then the container
-/// fields a bag refuses. `O(1)`.
+/// The boundary object top to bottom -- kind, unknown keys, the gussets, the orientation --
+/// then the container fields a bag refuses. `O(1)`.
 fn deformable_boundary(
     container: &Map<String, Value>,
     raw: &Value,
@@ -600,18 +625,13 @@ fn deformable_boundary(
     one_of(kind, &join(field, "kind"), &DEFORMABLE_BOUNDARY_KINDS)?;
     let gusseted = kind.as_str() == Some(GUSSETED_BAG);
     let known: &[&str] = if gusseted {
-        &["kind", "side_gusset_depth"]
+        &GUSSETED_BAG_FIELDS
     } else {
         &["kind"]
     };
     known_fields(boundary, field, known)?;
     if gusseted {
-        side_gusset_depth(
-            container,
-            required(boundary, "side_gusset_depth", field)?,
-            &join(field, "side_gusset_depth"),
-            unit,
-        )?;
+        gusseted_bag(container, boundary, field, unit)?;
     }
     for name in BAG_EXCLUSIONS {
         if set_beside_a_bag(name, present(container.get(name))) {
@@ -625,13 +645,55 @@ fn deformable_boundary(
     Ok(())
 }
 
-/// A length, positive once read in ticks, and no deeper than the bag's inner width (1.10).
-fn side_gusset_depth(
+/// The side gusset, then the bottom one, each a positive length within its fold; with
+/// neither, the side gusset is reported missing as in 1.10. Then the orientation, and a
+/// standing bag's bottom gusset. `O(1)`.
+fn gusseted_bag(
     container: &Map<String, Value>,
-    value: &Value,
+    boundary: &Map<String, Value>,
     field: &str,
     unit: &str,
 ) -> Checked {
+    let side = present(boundary.get("side_gusset_depth"));
+    let bottom = present(boundary.get("bottom_gusset_depth"));
+    if side.is_none() && bottom.is_none() {
+        required(boundary, "side_gusset_depth", field)?;
+    }
+    let inner = inner_ticks(container, unit);
+    if let Some(side) = side {
+        gusset_depth(
+            side,
+            &join(field, "side_gusset_depth"),
+            inner[1],
+            "exceeds inner_dimensions width",
+            unit,
+        )?;
+    }
+    if let Some(bottom) = bottom {
+        gusset_depth(
+            bottom,
+            &join(field, "bottom_gusset_depth"),
+            2 * inner[0],
+            "exceeds twice inner_dimensions length",
+            unit,
+        )?;
+    }
+    let Some(orientation) = present(boundary.get("orientation")) else {
+        return Ok(());
+    };
+    one_of(orientation, &join(field, "orientation"), &BAG_ORIENTATIONS)?;
+    if orientation.as_str() == Some(STANDING) && bottom.is_none() {
+        return Err(RequestError::new(
+            "missing_field",
+            join(field, "bottom_gusset_depth"),
+            "is required when orientation is standing",
+        ));
+    }
+    Ok(())
+}
+
+/// A length, positive once read in ticks, and no deeper than its fold allows.
+fn gusset_depth(value: &Value, field: &str, deepest: i128, too_deep: &str, unit: &str) -> Checked {
     measure(value, field, MeasureKind::Length, unit)?;
     let depth = measure_ticks(value, unit, MeasureKind::Length).unwrap_or(0);
     if depth == 0 {
@@ -641,12 +703,8 @@ fn side_gusset_depth(
             "must be positive",
         ));
     }
-    if depth > inner_ticks(container, unit)[1] {
-        return Err(RequestError::new(
-            "invalid_value",
-            field,
-            "exceeds inner_dimensions width",
-        ));
+    if depth > deepest {
+        return Err(RequestError::new("invalid_value", field, too_deep));
     }
     Ok(())
 }
@@ -722,7 +780,48 @@ fn rate_table(raw: &Value, at: &str, currency: Option<&str>) -> Checked {
     }
     optional(table, "currency", at, |value, field| {
         rate_table_currency(currency_text(value, field)?, field, currency)
-    })
+    })?;
+    let integer_of = |name: &str| {
+        present(table.get(name))
+            .and_then(json_integer)
+            .map_or(0, i128::from)
+    };
+    let top_price = present(table.get("prices_minor"))
+        .and_then(Value::as_array)
+        .and_then(|prices| prices.iter().filter_map(json_integer).max());
+    match top_price {
+        Some(top) => rate_table_ceiling(
+            i128::from(top),
+            integer_of("minimum_charge_minor"),
+            integer_of("fuel_surcharge_permille"),
+            at,
+        ),
+        None => Ok(()),
+    }
+}
+
+/// M1: the dearest landed cost a table can quote -- its top price or minimum charge, plus the
+/// fuel surcharge on it -- stays within 2^53 - 1, in exact arithmetic, so no engine rounds it
+/// and `charge_minor` cannot overflow. A property of the table, whatever the objective.
+/// Shared with the typed request path. O(1).
+pub(crate) fn rate_table_ceiling(
+    top_price: i128,
+    minimum_charge: i128,
+    fuel_permille: i128,
+    field: &str,
+) -> Checked {
+    let base = top_price.max(minimum_charge);
+    let landed = base + (base * fuel_permille + 999) / 1000;
+    if landed <= i128::from(MAX_EXACT_MAGNITUDE) {
+        return Ok(());
+    }
+    Err(RequestError::new(
+        "above_maximum",
+        field,
+        format!(
+            "must price its top bracket at most {MAX_EXACT_MAGNITUDE} minor units with the fuel surcharge"
+        ),
+    ))
 }
 
 fn currency_code(value: &Value, field: &str) -> Checked {

@@ -188,9 +188,7 @@ impl Ratio {
     }
 
     pub(crate) fn compare(self, other: Ratio) -> Res<Ordering> {
-        let left = mul_wide_sign(self.numerator, other.denominator);
-        let right = mul_wide_sign(other.numerator, self.denominator);
-        Ok(left.cmp(&right))
+        Ok(self.cmp(&other))
     }
 
     pub(crate) fn compare_int(self, value: i128) -> Res<Ordering> {
@@ -213,6 +211,22 @@ impl Ratio {
         } else {
             magnitude
         }
+    }
+}
+
+/// Value order, exact through a 256-bit cross product. A `Ratio` is always reduced with a
+/// positive denominator, so the derived equality is value equality and agrees with this.
+impl Ord for Ratio {
+    fn cmp(&self, other: &Self) -> Ordering {
+        let left = mul_wide_sign(self.numerator, other.denominator);
+        let right = mul_wide_sign(other.numerator, self.denominator);
+        left.cmp(&right)
+    }
+}
+
+impl PartialOrd for Ratio {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
     }
 }
 

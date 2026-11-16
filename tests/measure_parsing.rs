@@ -97,3 +97,70 @@ fn every_unit_spelling_reads_and_writes_exactly() {
     assert_eq!(Length(5).to_json("ticks")["value"], "5");
     assert_eq!(Length(-8_000).to_json("mm")["value"], "-0.5");
 }
+
+/// The reference's grammar (K1): an optional sign, ASCII digits, then a decimal point with
+/// digits on both sides, a fraction, or a mixed fraction -- and nothing else.
+#[test]
+fn only_the_reference_grammar_is_a_number() {
+    for text in [
+        "100.",
+        ".5",
+        "0x64",
+        "1e2",
+        "1_0",
+        "1,5",
+        "- 5",
+        "1 -1/2",
+        "1 +1/2",
+        "1 1/-2",
+        "1/-2",
+        "1..5",
+        "1 2 3",
+        "1/2/3",
+        "\u{0663}",
+        "1.1234567890123456789",
+        "1.000000000000000000000001",
+    ] {
+        assert_eq!(refused(json!(text)), text, "{text:?} is not a number");
+    }
+}
+
+#[test]
+fn the_reference_spellings_are_all_read() {
+    assert_eq!(ticks(json!("100")), 100 * Length::TICKS_PER_MM);
+    assert_eq!(ticks(json!("100.0")), 100 * Length::TICKS_PER_MM);
+    assert_eq!(ticks(json!("+5")), 5 * Length::TICKS_PER_MM);
+    assert_eq!(ticks(json!("0.5")), 8_000);
+    assert_eq!(ticks(json!("1 /2")), 8_000);
+    assert_eq!(ticks(json!("1\t/\n2")), 8_000);
+    assert_eq!(ticks(json!("1\u{00a0}1/2")), 24_000);
+    assert_eq!(ticks(json!("+1 1/2")), 24_000);
+    assert_eq!(ticks(json!("1.123456789012345678")), 17_975);
+}
+
+/// A mixed fraction takes its sign from the text, so `-0 1/2` is minus one half.
+#[test]
+fn a_mixed_fraction_is_signed_by_its_text() {
+    assert_eq!(refused(json!("-0 1/2")), "-0 1/2");
+    assert!(Length::parse(&json!("0 1/2"), "mm").is_ok());
+}
+
+/// The unit word at the end of a string is matched ignoring case, and only the words the
+/// reference lists; `millimeters` is a stated unit but not a suffix.
+#[test]
+fn a_unit_suffix_ignores_case() {
+    assert_eq!(ticks(json!("100 MM")), 100 * Length::TICKS_PER_MM);
+    assert_eq!(ticks(json!("100 Mm")), 100 * Length::TICKS_PER_MM);
+    assert_eq!(ticks(json!("1 INCH")), Length::TICKS_PER_INCH);
+    assert_eq!(ticks(json!("3 TICK")), 3);
+    assert_eq!(refused(json!("100 millimeters")), "100 millimeters");
+    let grams = |text: &str| Weight::parse(&json!(text), "kg").expect(text).0;
+    assert_eq!(grams("1 g"), Weight::TICKS_PER_G);
+    assert_eq!(grams("1 G"), Weight::TICKS_PER_G);
+    assert_eq!(grams("1 KG"), Weight::TICKS_PER_KG);
+    assert_eq!(grams("1 Lbs"), Weight::TICKS_PER_LB);
+    assert_eq!(grams("1 MG"), Weight::TICKS_PER_MG);
+    assert_eq!(grams("1 OZ"), Weight::TICKS_PER_OZ);
+    assert!(Weight::parse(&json!("1 mm"), "g").is_err());
+    assert!(Length::parse(&json!("1 g"), "mm").is_err());
+}

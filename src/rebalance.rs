@@ -232,7 +232,7 @@ pub fn rebalance_weight(
                     // rebalanced packing any more than through a packed one (
                     // review). Objective-gated inside the helper, so every other
                     // objective is untouched.
-                    if crate::solvers::unpriceable_container(&trial, &request.config).is_some() {
+                    if crate::billing::unpriceable_container(&trial, &request.config).is_some() {
                         continue;
                     }
                     committed = Some((
@@ -334,6 +334,7 @@ mod tests {
             made_to_measure: None,
             pallet_overhang_limit: None,
             deck: None,
+            upright_frame: false,
         }
     }
 

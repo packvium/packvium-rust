@@ -131,26 +131,52 @@ pub(crate) fn check_achieved_extent(
             ),
         ));
     }
-    if spec.flat_bag
-        && (add(a, c)? > spec.inner[0] || add(b, c)? > add(spec.inner[1], spec.side_gusset)?)
-    {
-        let gusset = if spec.side_gusset > 0 {
-            format!(", side gusset {}", spec.side_gusset)
-        } else {
-            String::new()
-        };
+    let breach = if spec.flat_bag {
+        girth_breach(spec, a, b, c)?
+    } else {
+        None
+    };
+    if let Some(breach) = breach {
         issues.push(Issue::new(
             "bag_girth_exceeded",
-            format!(
-                "{packed_id}: a + c = {}, b + c = {}, flat size {} x {}{gusset}",
-                add(a, c)?,
-                add(b, c)?,
-                spec.inner[0],
-                spec.inner[1],
-            ),
+            format!("{packed_id}: {breach}"),
         ));
     }
     packed_id.verify()
+}
+
+/// How a bag's package of extents `(a, b, c)` breaks a loop of film, or `None`.
+///
+/// Lying flat on an `L x W` bag: `2(a + c) <= 2L + K` and `b + c <= W + G`. Standing in its
+/// `W x H x L` frame: `2(b + c) <= 2L + K` and `a + b <= W + G` (1.10). `G`
+/// and `K` are the side and bottom gussets, 0 where none is declared.
+pub(crate) fn girth_breach(spec: &ContainerSpec, a: i128, b: i128, c: i128) -> Res<Option<String>> {
+    let (length, width, along, across) = if spec.standing {
+        (spec.inner[2], spec.inner[0], add(b, c)?, add(a, b)?)
+    } else {
+        (spec.inner[0], spec.inner[1], add(a, c)?, add(b, c)?)
+    };
+    if mul(2, along)? <= add(mul(2, length)?, spec.bottom_gusset)?
+        && across <= add(width, spec.side_gusset)?
+    {
+        return Ok(None);
+    }
+    let sums = if spec.standing {
+        format!("b + c = {along}, a + b = {across}, standing, length {length}, width {width}")
+    } else {
+        format!("a + c = {along}, b + c = {across}, flat size {length} x {width}")
+    };
+    let side = if spec.side_gusset > 0 {
+        format!(", side gusset {}", spec.side_gusset)
+    } else {
+        String::new()
+    };
+    let bottom = if spec.bottom_gusset > 0 {
+        format!(", bottom gusset {}", spec.bottom_gusset)
+    } else {
+        String::new()
+    };
+    Ok(Some(format!("{sums}{side}{bottom}")))
 }
 
 fn matches_ints(stated: Option<&[Json]>, expected: &[i128]) -> bool {

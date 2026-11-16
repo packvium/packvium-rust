@@ -6,7 +6,7 @@ use crate::geometry::{ALL_DIRECTIONS, Aabb, Dimensions, Point, Rotation, ShapeTy
 use crate::hull::{self, Vertex};
 use crate::made_to_measure::{MAX_EXACT_INTEGER, MadeToMeasure, sides_of};
 use crate::model::*;
-use crate::pallet_overhang::{OverhangLimit, solving_frame};
+use crate::pallet_overhang::{OverhangLimit, needs_solving_frame, solving_frame};
 use crate::policy::{PolicyConstraint, PolicyRuleSet};
 use crate::rebalance::rebalance_weight;
 use crate::request_errors;
@@ -64,7 +64,8 @@ pub fn rebalance_json(
     let request_value: Value = serde_json::from_str(request_input)?;
     let request = request_from_json(&request_value)?;
     validate_request(&request)?;
-    // A result's coordinates are in each pallet's solving frame.
+    // A result's coordinates are in each pallet's and standing bag's solving frame (,
+    //).
     let request = with_solving_frames(&request);
     let result_value: Value = serde_json::from_str(result_input)?;
     let original = parse_rebalance_result(&request, &result_value)?;
@@ -73,7 +74,7 @@ pub fn rebalance_json(
     // back a shipment with no published price under the caller's own objective (
     // review). Objective-gated inside the helper.
     if let Some((container_id, grams, bound)) =
-        crate::solvers::unpriceable_container(&original.containers, &request.config)
+        crate::billing::unpriceable_container(&original.containers, &request.config)
     {
         return Err(PackError::InvalidInput(format!(
             "container {container_id:?} bills at {grams} g, above its rate table's last \
@@ -417,11 +418,7 @@ pub fn pack_request_with_policy(
 ) -> PackResult<PackingResult> {
     validate_request(request)?;
     let framed;
-    let request = if request
-        .containers
-        .iter()
-        .any(|container| container.pallet_overhang_limit.is_some())
-    {
+    let request = if request.containers.iter().any(needs_solving_frame) {
         framed = with_solving_frames(request);
         &framed
     } else {
@@ -479,7 +476,7 @@ pub fn pack_request_with_policy(
     // the last bracket has no published price, and quoting one anyway is the failure this
     // objective exists to prevent.
     if let Some((container_id, grams, bound)) =
-        crate::solvers::unpriceable_container(&result.containers, &request.config)
+        crate::billing::unpriceable_container(&result.containers, &request.config)
     {
         return Err(PackError::InvalidInput(format!(
             "container {container_id:?} bills at {grams} g, above its rate table's last \
@@ -491,7 +488,7 @@ pub fn pack_request_with_policy(
     // ones that never passed through it, and an alternative quoting the sentinel is the
     // leak by another door.
     result.alternatives.retain(|alternative| {
-        crate::solvers::unpriceable_container(&alternative.containers, &request.config).is_none()
+        crate::billing::unpriceable_container(&alternative.containers, &request.config).is_none()
     });
     warn_unsupported_placements(&mut result, request.config.minimum_support_ratio);
     state_optimality(&mut result, objective_bound.as_deref());
@@ -1405,8 +1402,10 @@ fn parse_effort_budget(value: Option<&Value>) -> PackResult<Option<EffortBudget>
     let field = |name: &str| -> PackResult<Option<u64>> {
         match map.get(name) {
             None => Ok(None),
-            Some(value) => value
-                .as_u64()
+            // By value, as admission reads it: `1000.0` is the integer 1000 (JavaScript
+            // cannot tell the two apart), and `as_u64` alone would refuse it.
+            Some(value) => crate::canonical_json::json_integer(value)
+                .and_then(|value| u64::try_from(value).ok())
                 .filter(|value| *value > 0)
                 .map(Some)
                 .ok_or_else(|| {
@@ -1418,7 +1417,7 @@ fn parse_effort_budget(value: Option<&Value>) -> PackResult<Option<EffortBudget>
         max_candidates_evaluated: field("max_candidates_evaluated")?,
         max_placement_attempts: field("max_placement_attempts")?,
         max_search_nodes: field("max_search_nodes")?,
-        max_restarts: field("max_restarts")?.map(|value| value as usize),
+        max_restarts: field("max_restarts")?.map(to_usize),
     }))
 }
 
@@ -1695,10 +1694,10 @@ fn parse_container(value: &Value, unit: &str) -> PackResult<Container> {
             Some(Value::Object(limits)) => limits
                 .iter()
                 .map(|(tag, value)| {
-                    value
-                        .as_u64()
+                    crate::canonical_json::json_integer(value)
+                        .and_then(|limit| u64::try_from(limit).ok())
                         .filter(|limit| *limit > 0)
-                        .map(|limit| (tag.clone(), limit as usize))
+                        .map(|limit| (tag.clone(), to_usize(limit)))
                         .ok_or_else(|| {
                             PackError::InvalidInput(format!(
                                 "container.tag_limits.{tag} must be positive"
@@ -1723,6 +1722,7 @@ fn parse_container(value: &Value, unit: &str) -> PackResult<Container> {
         made_to_measure: parse_made_to_measure(map.get("made_to_measure"), unit)?,
         pallet_overhang_limit: parse_pallet_overhang_limit(map.get("pallet_overhang_limit"), unit)?,
         deck: None,
+        upright_frame: false,
     })
 }
 
@@ -1771,8 +1771,8 @@ fn parse_made_to_measure(value: Option<&Value>, unit: &str) -> PackResult<Option
 }
 
 /// `container.deformable_boundary`. `request_errors` has already refused every
-/// malformed shape and every excluded neighbour, so only the kind and a gusseted bag's
-/// side gusset depth (1.10) are read here.
+/// malformed shape and every excluded neighbour, so only the kind, a gusseted bag's two
+/// depths (1.10) and its orientation are read here.
 fn parse_deformable_boundary(
     value: Option<&Value>,
     unit: &str,
@@ -1782,12 +1782,24 @@ fn parse_deformable_boundary(
     };
     match boundary.get("kind").and_then(Value::as_str) {
         Some("flat_bag") => Ok(Some(DeformableBoundary::FlatBag)),
-        Some("gusseted_bag") => Ok(Some(DeformableBoundary::GussetedBag {
-            side_gusset_depth: Length::parse(
-                boundary.get("side_gusset_depth").unwrap_or(&Value::Null),
-                unit,
-            )?,
-        })),
+        Some("gusseted_bag") => {
+            // An absent depth is zero ticks, the model's spelling of no gusset.
+            let depth = |name: &str| {
+                boundary
+                    .get(name)
+                    .filter(|value| !value.is_null())
+                    .map_or(Ok(Length(0)), |value| Length::parse(value, unit))
+            };
+            let orientation = match boundary.get("orientation").and_then(Value::as_str) {
+                Some("standing") => BagOrientation::Standing,
+                _ => BagOrientation::Flat,
+            };
+            Ok(Some(DeformableBoundary::GussetedBag {
+                side_gusset_depth: depth("side_gusset_depth")?,
+                bottom_gusset_depth: depth("bottom_gusset_depth")?,
+                orientation,
+            }))
+        }
         _ => Err(PackError::InvalidInput(
             "container.deformable_boundary.kind must be flat_bag or gusseted_bag".into(),
         )),
@@ -2084,26 +2096,54 @@ fn admit_machine(container: &Container, machine: MadeToMeasure) -> PackResult<()
     Ok(())
 }
 
-/// A library caller's gusseted bag, held to the JSON path's rule (1.10): a side gusset that
-/// is positive and no deeper than the bag is wide, since a deeper fold would have no flat
-/// sheet left to fold from. A flat bag and a missing depth cannot be spelled in this type.
-/// `O(1)`.
+/// A library caller's gusseted bag, held to the JSON path's rule (1.10): a side
+/// gusset, a bottom gusset or both, zero ticks meaning none and a negative depth refused; a
+/// side gusset no deeper than the bag is wide and a bottom one no deeper than twice its
+/// length, since a deeper fold would have no flat sheet left to fold from; and a bottom
+/// gusset to stand on when standing. With neither depth the side gusset is refused as 1.10
+/// refused a zero one, so a 1.10 caller sees no new error. `O(1)`.
 fn admit_gusset(container: &Container, boundary: DeformableBoundary) -> PackResult<()> {
-    let DeformableBoundary::GussetedBag { side_gusset_depth } = boundary else {
+    let DeformableBoundary::GussetedBag {
+        side_gusset_depth,
+        bottom_gusset_depth,
+        orientation,
+    } = boundary
+    else {
         return Ok(());
     };
-    let depth = side_gusset_depth.0;
-    let refuse = |detail: &str| {
+    let refuse = |detail: String| {
         Err(PackError::InvalidInput(format!(
-            "container {} side_gusset_depth {detail}",
+            "container {} {detail}",
             container.id
         )))
     };
-    if depth <= 0 {
-        return refuse("must be positive");
+    if side_gusset_depth.0 == 0 && bottom_gusset_depth.0 == 0 {
+        return refuse("side_gusset_depth must be positive".into());
     }
-    if depth > container.inner_dimensions.width.0 {
-        return refuse("exceeds inner_dimensions width");
+    let declared = container.declared_inner();
+    for (name, depth, deepest, what) in [
+        (
+            "side_gusset_depth",
+            side_gusset_depth.0,
+            i128::from(declared.width.0),
+            "inner_dimensions width",
+        ),
+        (
+            "bottom_gusset_depth",
+            bottom_gusset_depth.0,
+            2 * i128::from(declared.length.0),
+            "twice inner_dimensions length",
+        ),
+    ] {
+        if depth < 0 {
+            return refuse(format!("{name} must be positive"));
+        }
+        if i128::from(depth) > deepest {
+            return refuse(format!("{name} exceeds {what}"));
+        }
+    }
+    if orientation == BagOrientation::Standing && bottom_gusset_depth.0 == 0 {
+        return refuse("bottom_gusset_depth is required when orientation is standing".into());
     }
     Ok(())
 }
@@ -2158,8 +2198,8 @@ fn admit_pallet(container: &Container, limit: OverhangLimit) -> PackResult<()> {
     Ok(())
 }
 
-/// The request every solver packs: each pallet replaced by its solving frame, so
-/// no solver, bound or validator needs to know the limit exists. `O(c)` beside the clone.
+/// The request every solver packs: each pallet and standing bag replaced by its solving frame
+///, so no solver, bound or validator needs to know the limit exists. `O(c)` beside the clone.
 fn with_solving_frames(request: &PackingRequest) -> PackingRequest {
     PackingRequest {
         containers: request.containers.iter().map(solving_frame).collect(),
@@ -2180,7 +2220,20 @@ fn validate_request(request: &PackingRequest) -> PackResult<()> {
         ));
     }
     let mut ids = BTreeSet::new();
-    for item in &request.items {
+    for (index, item) in request.items.iter().enumerate() {
+        // First, so an oversized hull is refused before any per-vertex work runs.
+        if item
+            .hull_vertices
+            .as_ref()
+            .is_some_and(|vertices| vertices.len() > hull::MAXIMUM_VERTICES)
+        {
+            return Err(RequestError::new(
+                "above_maximum",
+                format!("/items/{index}/hull_vertices"),
+                hull::TOO_MANY_VERTICES,
+            )
+            .into());
+        }
         if item.quantity == 0 || !ids.insert(item.id.clone()) {
             return Err(PackError::InvalidInput(format!(
                 "invalid or duplicate item id {}",
@@ -2277,22 +2330,28 @@ fn validate_request(request: &PackingRequest) -> PackResult<()> {
 
 /// The JSON path's currency rules for a typed request, at the same pointers (F1): the
 /// request's code in ISO 4217 shape, then each rate table's in the same shape and equal to
-/// it. `O(containers)`.
+/// it, then its landed-cost ceiling (M1). `O(containers + brackets)`.
 fn refuse_foreign_currencies(request: &PackingRequest) -> PackResult<()> {
     let currency = request.currency.as_deref();
     if let Some(code) = currency {
         request_errors::currency_shape(code, "/currency")?;
     }
     for (index, container) in request.containers.iter().enumerate() {
-        let Some(code) = container
-            .rate_table
-            .as_ref()
-            .and_then(|table| table.currency.as_deref())
-        else {
+        let Some(table) = container.rate_table.as_ref() else {
             continue;
         };
-        let field = format!("/containers/{index}/rate_table/currency");
-        request_errors::rate_table_currency(code, &field, currency)?;
+        let at = format!("/containers/{index}/rate_table");
+        if let Some(code) = table.currency.as_deref() {
+            request_errors::rate_table_currency(code, &format!("{at}/currency"), currency)?;
+        }
+        if let Some(top_price) = table.prices_minor.iter().max() {
+            request_errors::rate_table_ceiling(
+                i128::from(*top_price),
+                i128::from(table.minimum_charge_minor),
+                i128::from(table.fuel_surcharge_permille),
+                &at,
+            )?;
+        }
     }
     Ok(())
 }
@@ -2465,8 +2524,14 @@ fn below_floor(scope: &str, key: &str, minimum: i64) -> String {
 }
 
 /// Saturates on a 32-bit target, where a count past its address space is already unreachable.
-fn to_usize(value: i64) -> usize {
-    usize::try_from(value).unwrap_or(usize::MAX)
+fn to_usize<T: TryInto<usize>>(value: T) -> usize {
+    saturate_into(value, usize::MAX)
+}
+
+/// Narrowing that clamps to `ceiling` instead of truncating; split out so a narrow target
+/// can be exercised on a 64-bit host.
+fn saturate_into<T: TryInto<U>, U>(value: T, ceiling: U) -> U {
+    value.try_into().unwrap_or(ceiling)
 }
 
 /// The request's `seed`, negative ones included; 42 only when none is given.
@@ -2545,6 +2610,67 @@ mod currency_tests {
             refusal(&request).as_deref(),
             Some("invalid_request: /currency: is required when a rate_table declares a currency")
         );
+    }
+
+    /// M1 holds on the typed door as on the JSON one, at the same pointer and message.
+    #[test]
+    fn a_typed_rate_table_past_the_money_ceiling_is_refused_at_its_pointer() {
+        let mut request = request_from_json(&json!({
+            "items": [{ "id": "cube", "dimensions": { "length": "1", "width": "1", "height": "1" } }],
+            "containers": [{ "id": "box",
+                             "inner_dimensions": { "length": "2", "width": "2", "height": "2" },
+                             "rate_table": { "weight_brackets_g": [5000], "prices_minor": [900] } }]
+        }))
+        .expect("admitted");
+        let refusal = |request: &PackingRequest| pack_request(request).err().map(|e| e.to_string());
+        let table = request.containers[0].rate_table.as_mut().expect("a table");
+        table.prices_minor = vec![4_503_599_627_370_495];
+        table.fuel_surcharge_permille = 1000;
+        assert_eq!(refusal(&request), None);
+        let table = request.containers[0].rate_table.as_mut().expect("a table");
+        table.prices_minor = vec![4_503_599_627_370_496];
+        assert_eq!(
+            refusal(&request).as_deref(),
+            Some(
+                "invalid_request: /containers/0/rate_table: must price its top bracket at most \
+                 9007199254740991 minor units with the fuel surcharge"
+            )
+        );
+        let table = request.containers[0].rate_table.as_mut().expect("a table");
+        table.prices_minor = vec![i64::MAX];
+        table.fuel_surcharge_permille = i64::MAX;
+        assert!(refusal(&request).is_some_and(|text| !text.contains("last bracket")));
+    }
+}
+
+#[cfg(test)]
+mod saturation_tests {
+    use super::{request_from_json, saturate_into, to_usize};
+    use serde_json::json;
+
+    /// The truncation only shows on a 32-bit target, so the clamp is pinned through an
+    /// explicit 32-bit ceiling; on this host that proves the helper, not the wasm build.
+    #[test]
+    fn a_narrowing_clamps_to_the_ceiling_instead_of_truncating() {
+        assert_eq!(saturate_into(1_u64 << 32, u32::MAX), u32::MAX);
+        assert_eq!(saturate_into(7_u64, u32::MAX), 7);
+        assert_eq!(to_usize(u64::MAX), usize::MAX);
+        assert_eq!(to_usize(i64::MAX), i64::MAX as usize);
+    }
+
+    #[test]
+    fn a_tag_limit_and_a_restart_cap_past_u32_survive_parsing_unchanged() {
+        let request = request_from_json(&json!({
+            "items": [{ "id": "cube", "dimensions": { "length": "1", "width": "1", "height": "1" } }],
+            "containers": [{ "id": "box",
+                             "inner_dimensions": { "length": "2", "width": "2", "height": "2" },
+                             "tag_limits": { "fragile": 4_294_967_296_u64 } }],
+            "configuration": { "effort_budget": { "max_restarts": 4_294_967_296_u64 } }
+        }))
+        .expect("admitted");
+        assert_eq!(request.containers[0].tag_limits["fragile"], 1_usize << 32);
+        let budget = request.config.effort_budget.expect("a budget");
+        assert_eq!(budget.max_restarts, Some(1_usize << 32));
     }
 }
 
@@ -3325,10 +3451,23 @@ mod model_builder_tests {
                 "{boundary}"
             );
         }
-        // A gusseted bag whose depth is not a length is refused by the parser too (1.10).
+        // A gusseted bag whose depth is not a length is refused by the parser too (1.10,
+        //); a missing one is `admit_gusset`'s, since either depth may be absent.
+        for depth in ["side_gusset_depth", "bottom_gusset_depth"] {
+            assert!(
+                !container(json!({"deformable_boundary": {"kind": "gusseted_bag", depth: [1]}}))
+                    .is_empty(),
+                "a gusseted bag with a {depth} that is not a length was parsed"
+            );
+        }
         assert!(
-            !container(json!({"deformable_boundary": {"kind": "gusseted_bag"}})).is_empty(),
-            "a gusseted bag without a depth was parsed"
+            parse_container(
+                &json!({"id": "c", "deformable_boundary": {"kind": "gusseted_bag"},
+                        "inner_dimensions": {"length": "20", "width": "20", "height": "20"}}),
+                "mm"
+            )
+            .is_ok(),
+            "a gusseted bag without a depth was refused by the parser"
         );
     }
 
@@ -3780,5 +3919,39 @@ mod signed_rotation_tests {
         assert_eq!(error.reason(), "invalid_value");
         assert_eq!(error.field(), "");
         assert!(error.to_string().ends_with(Rotation::SIGNED_NEEDS_A_HULL));
+    }
+
+    /// K3 on the typed door: `pack_request` and `rebalance_json` reach the cap through
+    /// `validate_request`, which reads it before any shape rule.
+    #[test]
+    fn the_typed_path_caps_a_hull_at_thirty_two_vertices() {
+        let mut item = hull(json!(["LWH"]), false).expect("a hull");
+        let lattice = |count: usize| -> Vec<Vertex> {
+            (0..count as i64)
+                .map(|n| [n % 4, n / 4 % 4, n / 16])
+                .collect()
+        };
+        let mut request = request_from_json(&json!({
+            "items": [{"id": "a", "dimensions": {"length": "1", "width": "1", "height": "1"}}],
+            "containers": [{"id": "c", "inner_dimensions": {"length": "1", "width": "1", "height": "1"}}],
+        }))
+        .expect("a valid request");
+        item.hull_vertices = Some(lattice(32));
+        request.items = vec![item.clone()];
+        assert!(
+            validate_request(&request).is_ok(),
+            "32 vertices are within the cap"
+        );
+        item.hull_vertices = Some(lattice(33));
+        request.items = vec![item];
+        for refused in [
+            validate_request(&request).expect_err("33 vertices"),
+            pack_request(&request).expect_err("33 vertices"),
+        ] {
+            assert_eq!(
+                refused.to_string(),
+                "invalid_request: /items/0/hull_vertices: must have at most 32 vertices"
+            );
+        }
     }
 }

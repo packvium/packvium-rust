@@ -4,7 +4,7 @@ name: rc
 # runs `cargo publish --dry-run`. Nothing is uploaded: crates.io has no test registry, and a
 # version published there "can never be overwritten, and the code cannot be deleted". A
 # consumer tries the RC as a git dependency on the tag:
-#   packvium = { git = "https://github.com/toxakara/packvium-rust", tag = "v<version>" }
+#   packvium = { git = "https://github.com/packvium/packvium-rust", tag = "v<version>" }
 # Publishing real `-rc` versions to crates.io would be the owner's decision; it needs no new
 # account, but every one stays on the crate page for good. There is no GitHub Release.
 
