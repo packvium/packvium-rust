@@ -8,7 +8,7 @@ Use it to pick the smallest carton for an order, build a pallet, load a shipping
 or load a truck within its axle ratings and delivery-stop order. Every answer comes back as
 coordinates and rotations for each item, with a reason for anything that did not fit.
 
-> **Version 1.11.0 — the public API is frozen.** Field names, status codes and the
+> **Version 1.12.0 — the public API is frozen.** Field names, status codes and the
 > objective vector do not change without a major version, so any `1.x` is a safe upgrade
 > from any earlier `1.x`.
 > Read [docs/GUARANTEES.md](https://github.com/packvium/packvium-rust/blob/main/docs/GUARANTEES.md)
@@ -24,7 +24,7 @@ or, in `Cargo.toml`:
 
 ```toml
 [dependencies]
-packvium = "1.11"
+packvium = "1.12"
 ```
 
 The package is `packvium` in `Cargo.toml` and the library is `packvium_core` in code. That
@@ -269,7 +269,7 @@ Pick the package for your stack; mixing them in one system is safe.
 | --- | --- | --- |
 | Python — [`packvium`](https://pypi.org/project/packvium/) | `pip install packvium` | [packvium-python](https://github.com/packvium/packvium-python) |
 | PHP — [`packvium/packvium`](https://packagist.org/packages/packvium/packvium) | `composer require packvium/packvium` | [packvium-php](https://github.com/packvium/packvium-php) |
-| Rust — [`packvium`](https://crates.io/crates/packvium) | `packvium = "1.11"` | [packvium-rust](https://github.com/packvium/packvium-rust) |
+| Rust — [`packvium`](https://crates.io/crates/packvium) | `packvium = "1.12"` | [packvium-rust](https://github.com/packvium/packvium-rust) |
 | Node.js — [`@packvium/engine`](https://www.npmjs.com/package/@packvium/engine) | `npm install @packvium/engine` | [packvium-node](https://github.com/packvium/packvium-node) |
 | Browser / WebAssembly — [`@packvium/browser`](https://www.npmjs.com/package/@packvium/browser) | `npm install @packvium/browser` | [packvium-wasm](https://github.com/packvium/packvium-wasm) |
 | PHP FFI bridge — [`packvium/native-bridge`](https://packagist.org/packages/packvium/native-bridge) | `composer require packvium/native-bridge` | [packvium-php-bridge](https://github.com/packvium/packvium-php-bridge) |
@@ -292,7 +292,7 @@ CodeMeta form.
 @software{packvium_rust,
   author  = {{Packvium contributors}},
   title   = {Packvium for Rust},
-  version = {1.11.0},
+  version = {1.12.0},
   license = {MIT},
   url     = {https://packvium.com}
 }

@@ -2721,7 +2721,7 @@ fn crush_free<T: LoadSubject>(bodies: &[T], loads: &[i128]) -> bool {
     })
 }
 
-fn inventory(request: &PackingRequest) -> BTreeMap<String, Option<usize>> {
+pub(super) fn inventory(request: &PackingRequest) -> BTreeMap<String, Option<usize>> {
     request
         .containers
         .iter()
@@ -2729,13 +2729,13 @@ fn inventory(request: &PackingRequest) -> BTreeMap<String, Option<usize>> {
         .collect()
 }
 
-fn decrement(inventory: &mut BTreeMap<String, Option<usize>>, id: &str) {
+pub(super) fn decrement(inventory: &mut BTreeMap<String, Option<usize>>, id: &str) {
     if let Some(Some(value)) = inventory.get_mut(id) {
         *value = value.saturating_sub(1);
     }
 }
 
-fn eligible_containers(
+pub(super) fn eligible_containers(
     request: &PackingRequest,
     items: &[ItemInstance],
     inventory: &BTreeMap<String, Option<usize>>,
@@ -3430,7 +3430,7 @@ pub(crate) const SCORE_SCALE: i128 = 1_000_000;
 /// `shipping_cost` deserves its own note: the old key ranked by the container's
 /// *dimensional* weight while the score charges `max(gross, dimensional)`, the billable
 /// weight. Selection optimised a figure nobody is charged whenever actual weight won.
-fn container_selection_key(
+pub(super) fn container_selection_key(
     state: &ContainerState,
     remaining_after: usize,
     remaining_before: usize,

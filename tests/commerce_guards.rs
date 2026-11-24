@@ -645,11 +645,11 @@ fn membership_is_defined_over_lists_strings_and_object_keys() {
 }
 
 #[test]
-fn minimum_signed_priority_loses_to_every_higher_priority_without_overflow() {
-    for higher_priority in [i64::MIN + 1, 0, i64::MAX] {
+fn minimum_portable_priority_loses_to_every_higher_priority() {
+    for higher_priority in [-PORTABLE + 1, 0, PORTABLE] {
         let rules = json!({"policy_rules": [
             {"rule_id": "a-minimum", "versions": [{
-                "scope": "carrier", "action": "reject", "priority": i64::MIN,
+                "scope": "carrier", "action": "reject", "priority": -PORTABLE,
                 "effective_at": 0, "predicates": [{"scope": "carrier", "field": "f", "operator": "absent"}],
             }]},
             {"rule_id": "z-higher", "versions": [{
@@ -657,7 +657,7 @@ fn minimum_signed_priority_loses_to_every_higher_priority_without_overflow() {
                 "effective_at": 0, "predicates": [{"scope": "carrier", "field": "f", "operator": "absent"}],
             }]},
             {"rule_id": "allow", "versions": [{
-                "scope": "carrier", "action": "allow", "priority": i64::MAX,
+                "scope": "carrier", "action": "allow", "priority": PORTABLE,
                 "effective_at": 0, "predicates": [{"scope": "carrier", "field": "f", "operator": "absent"}],
             }]},
         ]});
@@ -665,7 +665,7 @@ fn minimum_signed_priority_loses_to_every_higher_priority_without_overflow() {
             rules,
             json!({"scope": "carrier", "context": {}, "as_of": 0}),
         ))
-        .expect("every signed integer priority is valid");
+        .expect("every portable integer priority is valid");
         let answer: Value = serde_json::from_str(&answer).unwrap();
         assert_eq!(answer["decision"]["allowed"], false);
         assert_eq!(answer["decision"]["citation"]["rule_id"], "z-higher");
@@ -673,12 +673,38 @@ fn minimum_signed_priority_loses_to_every_higher_priority_without_overflow() {
     }
 }
 
+/// Commerce integers are held to `2^53 - 1` in every engine: past it JavaScript has
+/// already rounded the JSON number, so a wider Rust range would answer what JavaScript cannot.
+const PORTABLE: i64 = 9_007_199_254_740_991;
+
 #[test]
-fn minimum_signed_priority_is_preserved_when_reading_json() {
+fn a_priority_past_the_portable_range_is_refused_at_its_path() {
+    for priority in [i64::MIN, -PORTABLE - 1, PORTABLE + 1, i64::MAX] {
+        let rules = json!({"policy_rules": [{"rule_id": "r", "versions": [{
+            "scope": "carrier", "action": "reject", "priority": priority, "effective_at": 0,
+            "predicates": [{"scope": "carrier", "field": "f", "operator": "absent"}],
+        }]}]});
+        let error = evaluate_policy_json(&call(
+            rules,
+            json!({"scope": "carrier", "context": {}, "as_of": 0}),
+        ))
+        .expect_err("outside the portable range");
+        assert_eq!(
+            (error.path.as_str(), error.message.as_str()),
+            (
+                "document.policy_rules[0].versions[0].priority",
+                "expected an exact integer"
+            )
+        );
+    }
+}
+
+#[test]
+fn minimum_portable_priority_is_preserved_when_reading_json() {
     let answer = evaluate_policy_json(include_str!(
         "fixtures/policy-minimum-integer-priority.json"
     ))
-    .expect("the minimum signed integer is a valid priority");
+    .expect("the minimum portable integer is a valid priority");
     let answer: Value = serde_json::from_str(&answer).unwrap();
     assert_eq!(answer["decision"]["allowed"], false);
     assert_eq!(answer["decision"]["citation"]["rule_id"], "z-zero");
@@ -827,14 +853,10 @@ fn a_product_past_i64_is_a_malformed_request_not_a_wrapped_quote() {
 }
 
 #[test]
-fn a_total_past_i64_is_a_malformed_request_not_a_wrapped_quote() {
-    let accessorials = json!([
-        {"accessorial_id": "a", "flat_charge_minor": i64::MAX},
-        {"accessorial_id": "b", "flat_charge_minor": i64::MAX},
-    ]);
-    let error = quote_json(&overflow_quote(accessorials, json!(["a", "b"]), 0))
-        .expect_err("an accessorial total past i64 has no honest number");
-    assert_eq!(error.path, "request");
+fn an_accessorial_product_past_i64_is_a_malformed_request_not_a_wrapped_quote() {
+    // An input past 2^53 - 1 is refused at its path, so only a product can pass i64.
+    let accessorials = json!([{"accessorial_id": "a", "permille_of_base": LARGE}]);
+    assert!(ceiling_quote(LARGE, 0, accessorials, 1000, 1).is_err());
 }
 
 #[test]
@@ -857,20 +879,20 @@ const CEILING: i64 = 9_007_199_254_740_991;
 
 /// One tariff and one shipment, priced at `rate_per_kg` with the given fuel surcharge and
 /// accessorials (all requested). An `Err` is the input error's message, its path asserted.
-fn ceiling_quote(
+fn ceiling_input(
     rate_per_kg: i64,
     fuel_permille: i64,
     accessorials: Value,
     weight_g: i64,
     volume_mm3: i64,
-) -> Result<Value, String> {
+) -> String {
     let requested: Vec<Value> = accessorials
         .as_array()
         .expect("a list")
         .iter()
         .map(|entry| entry["accessorial_id"].clone())
         .collect();
-    let input = call(
+    call(
         json!({"tariffs": [{
             "carrier_id": "acme", "service_id": "ground",
             "versions": [{
@@ -883,13 +905,28 @@ fn ceiling_quote(
         json!({"carrier_id": "acme", "service_id": "ground", "tariff_version": 1,
                "zone": "zone-a", "actual_weight_g": weight_g, "volume_mm3": volume_mm3,
                "requested_accessorials": requested}),
-    );
-    quote_json(&input)
-        .map(|answer| serde_json::from_str(&answer).expect("a JSON answer"))
-        .map_err(|error| {
-            assert_eq!(error.path, "request");
-            error.message
-        })
+    )
+}
+
+fn ceiling_quote(
+    rate_per_kg: i64,
+    fuel_permille: i64,
+    accessorials: Value,
+    weight_g: i64,
+    volume_mm3: i64,
+) -> Result<Value, String> {
+    quote_json(&ceiling_input(
+        rate_per_kg,
+        fuel_permille,
+        accessorials,
+        weight_g,
+        volume_mm3,
+    ))
+    .map(|answer| serde_json::from_str(&answer).expect("a JSON answer"))
+    .map_err(|error| {
+        assert_eq!(error.path, "request");
+        error.message
+    })
 }
 
 fn above_ceiling(amount: &str) -> String {
@@ -904,26 +941,74 @@ fn a_quote_exactly_at_the_ceiling_is_answered() {
 }
 
 #[test]
-fn a_dimensional_weight_above_the_ceiling_refuses_the_quote() {
-    assert_eq!(
-        ceiling_quote(1, 0, json!([]), 1, CEILING + 1),
-        Err(above_ceiling("9007199254740992"))
-    );
+fn an_input_above_the_ceiling_is_refused_at_its_path() {
+    // Python, PHP and JavaScript refuse it the same way, so no engine computes from
+    // a number JavaScript has already rounded.
+    let flat = |charge: i64| json!([{"accessorial_id": "a", "flat_charge_minor": charge}]);
+    let version = "document.tariffs[0].versions[0]";
+    for (input, path) in [
+        (
+            ceiling_input(1, 0, json!([]), 1, CEILING + 1),
+            "request.volume_mm3".to_owned(),
+        ),
+        (
+            ceiling_input(0, 0, json!([]), CEILING + 1, 1),
+            "request.actual_weight_g".to_owned(),
+        ),
+        (
+            ceiling_input(CEILING + 1, 0, json!([]), 1000, 1),
+            format!("{version}.cost_per_dimensional_kg_minor[zone-a]"),
+        ),
+        (
+            ceiling_input(1000, 0, flat(i64::MAX), 1000, 1),
+            format!("{version}.accessorials[0].flat_charge_minor"),
+        ),
+    ] {
+        let error = quote_json(&input).expect_err("past the ceiling");
+        assert_eq!(
+            (error.path, error.message.as_str()),
+            (path, "expected an exact integer")
+        );
+    }
 }
 
 #[test]
-fn a_billed_weight_above_the_ceiling_refuses_the_quote() {
-    assert_eq!(
-        ceiling_quote(0, 0, json!([]), CEILING + 1, 1),
-        Err(above_ceiling("9007199254740992"))
-    );
+fn a_typed_weight_above_the_ceiling_is_refused_by_the_rater_itself() {
+    // JSON can no longer carry one past 2^53 - 1, but a typed `RatingRequest` is an `i64`.
+    let tariff = packvium_core::commerce::rating::Tariff {
+        carrier_id: "acme".to_owned(),
+        service_id: "ground".to_owned(),
+        version: 1,
+        effective_at: 0,
+        dimensional_weight_divisor: 1,
+        cost_per_dimensional_kg_minor: [("zone-a".to_owned(), 0)].into_iter().collect(),
+        minimum_charge_minor: 0,
+        fuel_surcharge_permille: 0,
+        accessorials: std::collections::BTreeMap::new(),
+    };
+    for (actual_weight_g, volume_mm3) in [(1, CEILING + 1), (CEILING + 1, 1)] {
+        let request = packvium_core::commerce::RatingRequest {
+            zone: "zone-a".to_owned(),
+            actual_weight_g,
+            volume_mm3,
+            requested_accessorials: Vec::new(),
+        };
+        assert_eq!(
+            packvium_core::commerce::rating::rate_tariff(&tariff, &request).err(),
+            Some(
+                packvium_core::commerce::RatingRejection::AmountAboveCeiling(
+                    i128::from(CEILING) + 1
+                )
+            )
+        );
+    }
 }
 
 #[test]
 fn a_base_charge_above_the_ceiling_refuses_the_quote() {
     assert_eq!(
-        ceiling_quote(CEILING + 1, 0, json!([]), 1000, 1),
-        Err(above_ceiling("9007199254740992"))
+        ceiling_quote(CEILING, 0, json!([]), 2000, 1),
+        Err(above_ceiling("18014398509481982"))
     );
 }
 
@@ -938,13 +1023,14 @@ fn a_fuel_surcharge_above_the_ceiling_refuses_the_quote() {
 
 #[test]
 fn an_accessorial_above_the_ceiling_refuses_the_quote() {
+    // Both inputs are inside; the second accessorial charges twice the base.
     let accessorials = json!([
         {"accessorial_id": "a", "flat_charge_minor": CEILING},
-        {"accessorial_id": "b", "flat_charge_minor": CEILING + 1},
+        {"accessorial_id": "b", "permille_of_base": 2000},
     ]);
     assert_eq!(
-        ceiling_quote(1000, 0, accessorials, 1000, 1),
-        Err(above_ceiling("9007199254740992"))
+        ceiling_quote(CEILING, 0, accessorials, 1000, 1),
+        Err(above_ceiling("18014398509481982"))
     );
 }
 

@@ -273,6 +273,70 @@ pub fn separating_axes(left: &HullShape, right: &HullShape) -> Vec<Axis> {
     axes.into_iter().collect()
 }
 
+/// Ceilings on the pair memo, in pairs and in axes held across all of them: the same two numbers
+/// as the Python and JavaScript memos. A request meets at most (rotated hulls + distinct box
+/// sizes) squared ordered pairs, so either bound is generous for one request; what they stop
+/// is a long-lived process accumulating pairs forever.
+const PAIR_PLAN_ENTRIES: usize = 256;
+const PAIR_PLAN_AXES: usize = 60_000;
+
+/// An ordered pair's separating axes, with each shape's projection interval on every one.
+pub struct PairPlan {
+    pub axes: Vec<Axis>,
+    pub left: Vec<(i128, i128)>,
+    pub right: Vec<(i128, i128)>,
+}
+
+/// Plans by the left shape's vertices, then the right's. A canonical vertex list is the whole
+/// of what determines a `HullShape`, and nesting the maps lets a lookup borrow both lists
+/// rather than clone them per collision test.
+type PairPlans = BTreeMap<Vec<Vertex>, BTreeMap<Vec<Vertex>, Rc<PairPlan>>>;
+
+thread_local! {
+    static PAIR_PLANS: RefCell<(PairPlans, usize, usize)> =
+        const { RefCell::new((BTreeMap::new(), 0, 0)) };
+}
+
+/// The ordered pair's axes and local projection intervals, built at most once (A-04).
+///
+/// All three depend on the two rotated shapes and never on where they stand: a placement only
+/// adds `origin . axis` to an interval. Rebuilding them per test made every collision check pay
+/// the `O(e_a * e_b)` axis product and `O(axes * (a + b))` projections again. A hit returns
+/// exactly what a rebuild would, and the memo empties whole at a ceiling, so no output can
+/// depend on whether it hit -- the same argument as `shape_for`.
+pub fn pair_plan(left: &HullShape, right: &HullShape) -> Rc<PairPlan> {
+    PAIR_PLANS.with(|memo| {
+        if let Some(found) = memo
+            .borrow()
+            .0
+            .get(left.vertices.as_slice())
+            .and_then(|plans| plans.get(right.vertices.as_slice()))
+        {
+            return Rc::clone(found);
+        }
+        let axes = separating_axes(left, right);
+        let plan = Rc::new(PairPlan {
+            left: axes.iter().map(|axis| left.projection(*axis)).collect(),
+            right: axes.iter().map(|axis| right.projection(*axis)).collect(),
+            axes,
+        });
+        let mut memo = memo.borrow_mut();
+        let (plans, entries, held_axes) = &mut *memo;
+        if *entries >= PAIR_PLAN_ENTRIES || *held_axes + plan.axes.len() > PAIR_PLAN_AXES {
+            plans.clear();
+            *entries = 0;
+            *held_axes = 0;
+        }
+        plans
+            .entry(left.vertices.clone())
+            .or_default()
+            .insert(right.vertices.clone(), Rc::clone(&plan));
+        *entries += 1;
+        *held_axes += plan.axes.len();
+        plan
+    })
+}
+
 /// Do two placed hulls overlap with positive volume?
 ///
 /// Touching is contact, not collision: the comparison is `<=`, keeping hulls consistent with
@@ -284,9 +348,10 @@ pub fn collide(
     right: &HullShape,
     right_origin: Vertex,
 ) -> bool {
-    for axis in separating_axes(left, right) {
-        let (left_low, left_high) = left.projection(axis);
-        let (right_low, right_high) = right.projection(axis);
+    let plan = pair_plan(left, right);
+    for ((axis, &(left_low, left_high)), &(right_low, right_high)) in
+        plan.axes.iter().copied().zip(&plan.left).zip(&plan.right)
+    {
         let left_shift = dot(left_origin, axis);
         let right_shift = dot(right_origin, axis);
         if left_high + left_shift <= right_low + right_shift
@@ -549,6 +614,37 @@ mod tests {
             error.to_string(),
             format!("a convex hull needs at least {MINIMUM_VERTICES} vertices, got 3")
         );
+    }
+
+    /// One plan per ordered pair, reused at every origin, answering what a fresh
+    /// build would; and past its bound the memo starts over rather than growing.
+    #[test]
+    fn a_shape_pair_is_planned_once_and_the_plan_memo_is_bounded() {
+        let small = HullShape::of(&cube(4)).expect("a cube is a hull");
+        let wedge = HullShape::of(&wedge(10)).expect("a wedge is a hull");
+        let first = pair_plan(&wedge, &small);
+        assert!(Rc::ptr_eq(&first, &pair_plan(&wedge, &small)));
+        for origin in [[0, 0, 0], [3, 3, 3], [6, 0, 2], [9, 9, 9], [12, 0, 0]] {
+            let fresh = separating_axes(&wedge, &small).into_iter().all(|axis| {
+                let (left_low, left_high) = wedge.projection(axis);
+                let (right_low, right_high) = small.projection(axis);
+                let shift = dot(origin, axis);
+                left_high > right_low + shift && right_high + shift > left_low
+            });
+            assert_eq!(
+                collide(&wedge, [0, 0, 0], &small, origin),
+                fresh,
+                "{origin:?}"
+            );
+        }
+        for side in 1..=PAIR_PLAN_ENTRIES as i64 + 1 {
+            pair_plan(
+                &small,
+                &HullShape::of(&cube(side)).expect("a cube is a hull"),
+            );
+        }
+        PAIR_PLANS.with(|memo| assert!(memo.borrow().1 <= PAIR_PLAN_ENTRIES));
+        assert!(!Rc::ptr_eq(&first, &pair_plan(&wedge, &small)));
     }
 
     /// Past its bound the memo starts over rather than growing, and a shape asked for after

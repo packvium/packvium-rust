@@ -123,6 +123,7 @@ pub(crate) fn check_request(data: &Value) -> Checked<&str> {
     }
     require_unique_ids(containers, "containers")?;
     total_weight(items, containers)?;
+    total_money(items, containers, unit)?;
     Ok(unit)
 }
 
@@ -153,6 +154,114 @@ fn total_weight(items: &[Value], containers: &[Value]) -> Checked {
         ));
     }
     Ok(())
+}
+
+/// M3: the most money the containers `item_count` items can open could sum to in a packing
+/// score, against `MAX_EXACT_MAGNITUDE` -- container cost first, then the landed charge. Each
+/// container is `(quantity, dearest cost_minor, dearest landed charge)`. Shared with the typed
+/// request path. `O(c log c)` for `c` containers.
+pub(crate) fn total_money_minor(
+    item_count: i128,
+    containers: &[(Option<i128>, i128, i128)],
+) -> Checked {
+    type Select = fn(&(Option<i128>, i128, i128)) -> i128;
+    let kinds: [(Select, &str); 2] = [
+        (|entry| entry.1, "must cost"),
+        (|entry| entry.2, "must bill"),
+    ];
+    for (select, message) in kinds {
+        let mut ordered = containers.to_vec();
+        ordered.sort_by_key(|entry| std::cmp::Reverse(select(entry)));
+        let mut remaining = item_count;
+        let mut total = 0_i128;
+        for entry in &ordered {
+            if remaining <= 0 {
+                break;
+            }
+            let opened = entry
+                .0
+                .map_or(remaining, |quantity| quantity.min(remaining));
+            total = total.saturating_add(opened.saturating_mul(select(entry)));
+            remaining -= opened;
+        }
+        if total > i128::from(MAX_EXACT_MAGNITUDE) {
+            return Err(RequestError::new(
+                "above_maximum",
+                "/containers",
+                format!(
+                    "{message} at most {MAX_EXACT_MAGNITUDE} minor units in all across the containers the items can open"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn total_money(items: &[Value], containers: &[Value], unit: &str) -> Checked {
+    let item_count = items
+        .iter()
+        .map(|item| {
+            present(item.get("quantity"))
+                .and_then(json_integer)
+                .map_or(1, i128::from)
+        })
+        .fold(0_i128, i128::saturating_add);
+    let stock = containers
+        .iter()
+        .map(|container| {
+            let map = container.as_object();
+            let fee = map
+                .and_then(|map| present(map.get("cost_minor")))
+                .and_then(json_integer)
+                .unwrap_or(0);
+            let cost = match map.and_then(|map| present(map.get("made_to_measure"))) {
+                Some(machine) => {
+                    let price = present(machine.get("cost_per_square_metre_minor"))
+                        .and_then(json_integer)
+                        .unwrap_or(0);
+                    let inner = map.map_or([0, 0, 0], |map| inner_ticks(map, unit));
+                    MadeToMeasure {
+                        minimum: [0; 3],
+                        increment: [1; 3],
+                        cost_per_square_metre_minor: price,
+                        tare_per_square_metre: 0,
+                        outer_allowance: [0; 3],
+                    }
+                    .largest_box_cost_minor(
+                        [inner[0] as i64, inner[1] as i64, inner[2] as i64],
+                        fee,
+                    )
+                }
+                None => i128::from(fee),
+            };
+            let landed = map
+                .and_then(|map| present(map.get("rate_table")))
+                .and_then(Value::as_object)
+                .map_or(0, |table| {
+                    let integer_of = |name: &str| {
+                        present(table.get(name))
+                            .and_then(json_integer)
+                            .map_or(0, i128::from)
+                    };
+                    present(table.get("prices_minor"))
+                        .and_then(Value::as_array)
+                        .and_then(|prices| prices.iter().filter_map(json_integer).max())
+                        .map_or(0, |top| {
+                            top_bracket_landed_minor(
+                                i128::from(top),
+                                integer_of("minimum_charge_minor"),
+                                integer_of("fuel_surcharge_permille"),
+                            )
+                        })
+                });
+            let quantity = map
+                .and_then(|map| present(map.get("quantity")))
+                .and_then(json_integer)
+                .map(i128::from);
+            (quantity, cost, landed)
+        })
+        .collect::<Vec<_>>();
+    total_money_minor(item_count, &stock)
 }
 
 /// `base` extended by one RFC 6901 reference token, escaping `~` and `/` in it.
@@ -804,15 +913,24 @@ fn rate_table(raw: &Value, at: &str, currency: Option<&str>) -> Checked {
 /// fuel surcharge on it -- stays within 2^53 - 1, in exact arithmetic, so no engine rounds it
 /// and `charge_minor` cannot overflow. A property of the table, whatever the objective.
 /// Shared with the typed request path. O(1).
+pub(crate) fn top_bracket_landed_minor(
+    top_price: i128,
+    minimum_charge: i128,
+    fuel_permille: i128,
+) -> i128 {
+    let base = top_price.max(minimum_charge);
+    base + (base * fuel_permille + 999) / 1000
+}
+
 pub(crate) fn rate_table_ceiling(
     top_price: i128,
     minimum_charge: i128,
     fuel_permille: i128,
     field: &str,
 ) -> Checked {
-    let base = top_price.max(minimum_charge);
-    let landed = base + (base * fuel_permille + 999) / 1000;
-    if landed <= i128::from(MAX_EXACT_MAGNITUDE) {
+    if top_bracket_landed_minor(top_price, minimum_charge, fuel_permille)
+        <= i128::from(MAX_EXACT_MAGNITUDE)
+    {
         return Ok(());
     }
     Err(RequestError::new(

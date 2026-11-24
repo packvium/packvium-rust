@@ -4,6 +4,25 @@ What changed in `packvium` on crates.io, release by release. The format follows
 [Keep a Changelog](https://keepachangelog.com/1.1.0/) and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.12.0]
+
+The money ceiling covers sums, one name for unplaced items, and `exact_small` across containers.
+
+### Changed
+
+- **A request whose dearest openable containers cost more than 9007199254740991 minor units in
+  all,** or whose landed top brackets bill more than that in all, is refused at `/containers`.
+- **A commerce input integer outside ±(2^53 − 1)** is refused at its path with `expected an
+  exact integer`, including policy rule `priority`, which 1.11 accepted across all of `i64`.
+- **An unplaced item no finer reason explains is `no_feasible_placement`,** not
+  `search_exhausted` or `exact_search_incomplete`.
+- **`exact_small` pinned alone opens as many containers as the order needs** under every
+  objective, and answers a `lowest_landed_cost` request that has a priceable answer.
+
+### Performance
+
+- **Hull collision checks reuse each shape pair's separating axes and projections.**
+
 ## [1.11.0]
 
 Bottom gussets and standing pouches, a certified bound for the shipping objectives, one money

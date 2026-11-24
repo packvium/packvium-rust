@@ -262,6 +262,6 @@ fn an_item_no_single_container_admits_on_every_count_keeps_the_search_reason() {
     );
     assert_eq!(
         reasons(&result),
-        vec![("exact_search_incomplete".to_owned(), "observed".to_owned())]
+        vec![("no_feasible_placement".to_owned(), "observed".to_owned())]
     );
 }

@@ -102,8 +102,12 @@ pub(crate) fn solve_portfolio_with_deadline(
     } else {
         None
     };
+    // Only a one-container answer ends the portfolio here: past the first container the
+    // exact search continues greedily, which proves nothing against the other starts.
     if let Some(result) = exact_preflight.as_ref()
         && result.complete()
+        && result.containers.len() <= 1
+        && unpriceable_container(&result.containers, &request.config).is_none()
     {
         return Ok(finalize_single_start(result.clone(), deadline.expired()));
     }

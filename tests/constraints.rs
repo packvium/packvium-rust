@@ -908,7 +908,10 @@ fn an_axle_balanced_point_seats_the_envelope_under_a_clearance() {
     for profile in ["fast", "balanced", "quality"] {
         let result = solve(json!({
             "units": {"length": "mm"},
-            "configuration": {"solver_profile": profile, "clearance": "10"},
+            // Counted work, not the default clock: a loaded host once cut the search short.
+            "configuration": {"solver_profile": profile, "clearance": "10", "time_limit_ms": 60000,
+                "effort_budget": {"max_candidates_evaluated": 1000000,
+                    "max_placement_attempts": 1000000, "max_search_nodes": 1000000}},
             "items": [{"id": "drum", "allowed_rotations": ["LWH"],
                 "weight": {"value": "1000", "unit": "g"},
                 "dimensions": {"length": "200", "width": "100", "height": "100"}}],

@@ -57,9 +57,11 @@ pub fn list<'a>(value: &'a Value, path: &str) -> Parsed<&'a Vec<Value>> {
 
 pub fn integer(value: &Value, path: &str) -> Parsed<i64> {
     // A JSON boolean where an exact integer belongs is a caller mistake, not a 0 or 1.
+    // Past 2^53 - 1 JavaScript has already rounded the JSON number.
     match value {
         Value::Number(number) => number
             .as_i64()
+            .filter(|&found| found.unsigned_abs() <= 9_007_199_254_740_991)
             .map_or_else(|| fail(path, "expected an exact integer"), Ok),
         _ => fail(path, "expected an exact integer"),
     }
@@ -204,22 +206,22 @@ fn parse_tariff(value: &Value, path: &str, carrier_id: &str, service_id: &str) -
     )?;
     let zones_path = format!("{path}.cost_per_dimensional_kg_minor");
     let mut cost_per_dimensional_kg_minor = BTreeMap::new();
-    // Code-point order of the key (UTF-8 byte order), so the first refusal never depends on the
-    // map's own iteration order or on another language's.
+    // Code-point order of the key (UTF-8 byte order), checking every entry's integer type before
+    // any negative-value check so the first refusal matches Python and PHP.
     let mut zones: Vec<(&String, &Value)> =
         object(&fields["cost_per_dimensional_kg_minor"], &zones_path)?
             .iter()
             .collect();
     zones.sort_unstable_by(|left, right| left.0.cmp(right.0));
-    for (zone, cost) in zones {
+    for (zone, cost) in &zones {
         let cost = integer(cost, &format!("{zones_path}[{zone}]"))?;
-        if cost < 0 {
-            return fail(
-                &zones_path,
-                "cost_per_dimensional_kg_minor entries cannot be negative",
-            );
-        }
-        cost_per_dimensional_kg_minor.insert(zone.clone(), cost);
+        cost_per_dimensional_kg_minor.insert((*zone).clone(), cost);
+    }
+    if cost_per_dimensional_kg_minor.values().any(|&cost| cost < 0) {
+        return fail(
+            &zones_path,
+            "cost_per_dimensional_kg_minor entries cannot be negative",
+        );
     }
     let effective_at = integer(&fields["effective_at"], &format!("{path}.effective_at"))?;
     let dimensional_weight_divisor = integer(
