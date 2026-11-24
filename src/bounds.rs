@@ -1439,8 +1439,8 @@ mod tests {
         );
         let bound = &result["optimality"]["lower_bound"];
         assert_eq!((&bound[0], &bound[1]), (&Value::from(0), &Value::from(200)));
-        // This engine is not held to Python's placements, only to a bound no score falls below.
-        assert!(result["score"][1].as_i64().expect("charge") >= 200);
+        assert_eq!(result["score"][1], 200);
+        assert_eq!(result["summary"]["container_count"], 2);
     }
 
     fn priced(brackets: Vec<(i128, Option<i128>)>, dimensional: i128) -> Billing {
@@ -1581,7 +1581,7 @@ mod tests {
     /// stated bound is the one the validator recomputes.
     #[test]
     fn the_landed_bound_reads_payload_slot_and_shrinking_limits_alike_in_engine_and_validator() {
-        let mut request = landed_request(
+        let request = landed_request(
             serde_json::json!([
                 {"id": "bulky",
                  "inner_dimensions": {"length": "500", "width": "500", "height": "500"},
@@ -1593,12 +1593,9 @@ mod tests {
                 "nesting_height": "10",
                 "dimensions": {"length": "100", "width": "100", "height": "50"}}]),
         );
-        // `balanced` rather than Python's `exact_small`: this engine's exact search ends on
-        // the unpriceable box here and refuses the pack, which says nothing about the
-        // bound.
-        request["configuration"]["solver_profile"] = "balanced".into();
         let result = packed_with_issues(&request);
         assert_eq!(result["optimality"]["lower_bound"][1], 400);
+        assert_eq!(result["score"][1], 600);
     }
 
     /// A payload no instance fits places nothing, opens nothing and bills nothing.

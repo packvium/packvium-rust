@@ -443,6 +443,8 @@ pub fn pack_request_with_policy(
     cite_policy_rejections(&mut result, request, policy);
     cite_support_rejections(&mut result, request, &registry.constraints);
     cite_limit_rejections(&mut result, request);
+    name_observed_fallbacks(&mut result);
+    sort_unpacked_in_request_order(&mut result, request);
     result.catalog_versions_used = request.catalog_versions_used.clone();
     echo_currency(&mut result, request.currency.as_deref());
     // Independent validation re-derives every guarantee from per-item placements.
@@ -682,6 +684,52 @@ fn cite_limit_rejections(result: &mut PackingResult, request: &PackingRequest) {
     }
     for alternative in &mut result.alternatives {
         cite_limit_rejections(alternative, request);
+    }
+}
+
+/// An item no finer diagnosis explains is reported as `no_feasible_placement`, the
+/// reference's name for it, whichever search gave up -- the owner's decision of 2026-11-21,
+/// replacing the per-engine names allowed. The solvers keep `search_exhausted` and
+/// `exact_search_incomplete` internally, where the exact search reads its own verdicts and the
+/// diagnoses above choose which items to ask about; only the answer handed back changes.
+/// Alternatives too, for the reason `cite_policy_rejections` gives. `O(u)` per solution.
+fn name_observed_fallbacks(result: &mut PackingResult) {
+    for unpacked in &mut result.unpacked {
+        if matches!(
+            unpacked.reason.as_str(),
+            "search_exhausted" | "exact_search_incomplete"
+        ) {
+            let instance = unpacked.instance.clone();
+            let details = std::mem::take(&mut unpacked.details);
+            *unpacked = UnpackedItem::new(instance, "no_feasible_placement".into(), details);
+        }
+    }
+    for alternative in &mut result.alternatives {
+        name_observed_fallbacks(alternative);
+    }
+}
+
+/// `unpacked` in the order the request listed the items, each item's instances by
+/// number -- the order every engine reports, whichever search left the items out and in
+/// whichever order it gave up on them. Alternatives too. `O(n + u log u)` per solution.
+fn sort_unpacked_in_request_order(result: &mut PackingResult, request: &PackingRequest) {
+    let order: BTreeMap<&str, usize> = request
+        .items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| (item.id.as_str(), index))
+        .collect();
+    sort_unpacked_by(result, &order);
+}
+
+fn sort_unpacked_by(result: &mut PackingResult, order: &BTreeMap<&str, usize>) {
+    result.unpacked.sort_by_key(|unpacked| {
+        let instance = &unpacked.instance;
+        let index = order.get(instance.item.id.as_str()).copied();
+        (index.unwrap_or(usize::MAX), instance.sequence)
+    });
+    for alternative in &mut result.alternatives {
+        sort_unpacked_by(alternative, order);
     }
 }
 
@@ -2325,7 +2373,46 @@ fn validate_request(request: &PackingRequest) -> PackResult<()> {
             }
         }
     }
-    refuse_routes_beside_pallets(request)
+    refuse_routes_beside_pallets(request)?;
+    refuse_excessive_money(request)
+}
+
+/// M3 on a typed request: the most money the containers `request.items` can open could sum to
+/// in a packing score stays within `2^53 - 1`, matching the JSON path. `O(c log c)`.
+fn refuse_excessive_money(request: &PackingRequest) -> PackResult<()> {
+    let item_count = request
+        .items
+        .iter()
+        .map(|item| item.quantity as i128)
+        .fold(0_i128, i128::saturating_add);
+    let stock = request
+        .containers
+        .iter()
+        .map(|container| {
+            let cost = match container.made_to_measure {
+                Some(machine) => machine.largest_box_cost_minor(
+                    sides_of(container.inner_dimensions),
+                    container.cost_minor,
+                ),
+                None => i128::from(container.cost_minor),
+            };
+            let landed = container.rate_table.as_ref().map_or(0, |table| {
+                table.prices_minor.iter().max().map_or(0, |top| {
+                    request_errors::top_bracket_landed_minor(
+                        i128::from(*top),
+                        i128::from(table.minimum_charge_minor),
+                        i128::from(table.fuel_surcharge_permille),
+                    )
+                })
+            });
+            let quantity = container
+                .quantity
+                .and_then(|quantity| i128::try_from(quantity).ok());
+            (quantity, cost, landed)
+        })
+        .collect::<Vec<_>>();
+    request_errors::total_money_minor(item_count, &stock)?;
+    Ok(())
 }
 
 /// The JSON path's currency rules for a typed request, at the same pointers (F1): the

@@ -14,8 +14,9 @@ const MESSAGE: &str =
 const CEILING: i64 = 9_007_199_254_740_991;
 
 fn json_request(table: Value, objective: &str) -> Value {
+    // One cube opens one container, so only M1 applies, not the summed ceiling.
     let mut request = json!({
-        "items": [{ "id": "cube", "quantity": 2, "weight": "1000",
+        "items": [{ "id": "cube", "quantity": 1, "weight": "1000",
                     "dimensions": { "length": "100", "width": "100", "height": "100" } }],
         "containers": [
             { "id": "plain",

@@ -1559,8 +1559,11 @@ mod tests {
         assert!(order_of(&Json::Null).is_none());
     }
 
+    /// A score past 2^53 - 1 used to reach the gap statement and have only the gap withheld.
+    /// refuses the worst-case summed cost at admission, so no admitted request has a
+    /// gap past the ceiling.
     #[test]
-    fn unrepresentable_gaps_are_withheld_and_rejected_when_forged() {
+    fn a_cost_sum_past_the_portable_ceiling_is_refused_before_any_gap_is_stated() {
         for cheap_cost in [0i64, 1] {
             let request = serde_json::json!({
                 "items": [{"id": "i", "quantity": 2, "dimensions": {"length":"10", "width":"10", "height":"10"}}],
@@ -1569,22 +1572,12 @@ mod tests {
                     {"id":"big", "inner_dimensions":{"length":"10", "width":"10", "height":"10"}, "cost_minor":9007199254740991i64, "max_items":1}
                 ]
             }).to_string();
-            let mut result = packed(&request);
+            let error =
+                crate::pack_json(&request).expect_err("the summed cost is past the ceiling");
+            let refusal = error.request_error().expect("a named refusal");
             assert_eq!(
-                result["optimality"],
-                serde_json::json!({"code":"not_proven"})
-            );
-            assert!(issues(&request, &result).is_empty());
-            let absolute = 18014398509481982i64 - 2 * cheap_cost;
-            result["optimality"] = serde_json::json!({"code":"not_proven", "lower_bound":[0,2,2*cheap_cost], "gap_key":2, "absolute_gap":absolute});
-            if cheap_cost != 0 {
-                result["optimality"]["relative_gap"] =
-                    serde_json::json!({"numerator":absolute,"denominator":2*cheap_cost});
-            }
-            assert!(
-                issues(&request, &result)
-                    .iter()
-                    .any(|issue| issue.code == "optimality_gap_mismatch")
+                (refusal.reason(), refusal.field()),
+                ("above_maximum", "/containers")
             );
         }
     }

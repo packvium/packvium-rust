@@ -78,7 +78,7 @@ pub(crate) enum MeasureKind {
 impl MeasureKind {
     /// Ticks per `unit`, matched ignoring case and surrounding space as the reference does.
     fn multiplier(self, unit: &str) -> Option<i64> {
-        let unit = unit.trim().to_ascii_lowercase();
+        let unit = unit.trim_matches(is_written_space).to_ascii_lowercase();
         Some(match (self, unit.as_str()) {
             (_, "tick" | "ticks") => 1,
             (Self::Length, "mm" | "millimeter" | "millimeters") => Length::TICKS_PER_MM,
@@ -131,15 +131,36 @@ fn unbounded_ticks(
     kind: MeasureKind,
 ) -> PackResult<(String, i128)> {
     let (raw, unit) = scalar_and_unit(value, default_unit, kind)?;
-    let multiplier = kind
-        .multiplier(&unit)
-        .ok_or_else(|| PackError::UnsupportedUnit(unit.trim().to_ascii_lowercase()))?;
-    let (numerator, denominator) = parse_rational(&raw)?;
-    let scaled = numerator
-        .checked_mul(multiplier as i128)
-        .ok_or_else(|| PackError::InvalidNumber(raw.clone()))?;
-    let ticks = round_half_even(scaled, denominator)?;
+    let multiplier = kind.multiplier(&unit).ok_or_else(|| {
+        PackError::UnsupportedUnit(unit.trim_matches(is_written_space).to_ascii_lowercase())
+    })?;
+    if let Ok((numerator, denominator)) = parse_rational(&raw)
+        && let Some(scaled) = numerator.checked_mul(multiplier as i128)
+        && let Ok(ticks) = round_half_even(scaled, denominator)
+    {
+        return Ok((raw, ticks));
+    }
+    let ticks = exact_unbounded_ticks(&raw, multiplier)?;
     Ok((raw, ticks))
+}
+
+fn exact_unbounded_ticks(raw: &str, multiplier: i64) -> PackResult<i128> {
+    let (negative, numerator, denominator) =
+        exact_fraction(raw).ok_or_else(|| PackError::InvalidNumber(raw.to_owned()))?;
+    let scaled = digits_mul(&numerator, &digits_of(multiplier as u128));
+    let (quotient, remainder) = digits_div_rem(&scaled, &denominator);
+    let doubled = digits_mul(&remainder, &[2]);
+    let odd = quotient.first().copied().unwrap_or(0) % 2 == 1;
+    let rounded = match digits_cmp(&doubled, &denominator) {
+        Ordering::Less => quotient,
+        Ordering::Greater => digits_add(&quotient, &[1]),
+        Ordering::Equal if odd => digits_add(&quotient, &[1]),
+        Ordering::Equal => quotient,
+    };
+    let magnitude = digits_to_u128(&rounded)
+        .and_then(|value| i128::try_from(value).ok())
+        .ok_or_else(|| PackError::InvalidNumber(raw.to_owned()))?;
+    Ok(if negative { -magnitude } else { magnitude })
 }
 
 fn bounded_ticks(value: &Value, default_unit: &str, kind: MeasureKind) -> PackResult<i64> {
@@ -186,11 +207,11 @@ pub(crate) fn overflowed_measure(
     else {
         return Overflowed::Unreadable;
     };
-    if numerator.is_empty() {
-        return Overflowed::Unreadable;
-    }
     if negative {
         return Overflowed::Negative;
+    }
+    if numerator.is_empty() {
+        return Overflowed::Unreadable;
     }
     let doubled = digits_mul(&numerator, &digits_of(2 * multiplier as u128));
     let threshold = digits_mul(&denominator, &digits_of(2 * u128::from(ceiling) + 1));
@@ -302,7 +323,7 @@ fn read_written(text: &str) -> Option<Written<'_>> {
 
 /// A measure's text as the grammar reads it: trimmed, no-break spaces plain.
 fn normalized(text: &str) -> String {
-    text.trim().replace('\u{00a0}', " ")
+    text.trim_matches(is_written_space).replace('\u{00a0}', " ")
 }
 
 /// `parse_rational` over little-endian decimal digits, without leading zeros: the sign,
@@ -400,6 +421,54 @@ fn digits_cmp(a: &[u8], b: &[u8]) -> Ordering {
         .then_with(|| a.iter().rev().cmp(b.iter().rev()))
 }
 
+fn digits_sub(a: &[u8], b: &[u8]) -> Vec<u8> {
+    let mut diff = Vec::with_capacity(a.len());
+    let mut borrow = 0_i16;
+    for (index, &left) in a.iter().enumerate() {
+        let mut digit = i16::from(left) - i16::from(*b.get(index).unwrap_or(&0)) - borrow;
+        if digit < 0 {
+            digit += 10;
+            borrow = 1;
+        } else {
+            borrow = 0;
+        }
+        diff.push(digit as u8);
+    }
+    while diff.last() == Some(&0) {
+        diff.pop();
+    }
+    diff
+}
+
+fn digits_div_rem(numerator: &[u8], denominator: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let mut quotient_rev = Vec::with_capacity(numerator.len());
+    let mut remainder = Vec::new();
+    for &digit in numerator.iter().rev() {
+        if !remainder.is_empty() || digit != 0 {
+            remainder.insert(0, digit);
+        }
+        let mut q = 0_u8;
+        while digits_cmp(&remainder, denominator) != Ordering::Less {
+            remainder = digits_sub(&remainder, denominator);
+            q += 1;
+        }
+        quotient_rev.push(q);
+    }
+    quotient_rev.reverse();
+    while quotient_rev.last() == Some(&0) {
+        quotient_rev.pop();
+    }
+    (quotient_rev, remainder)
+}
+
+fn digits_to_u128(digits: &[u8]) -> Option<u128> {
+    let mut value = 0_u128;
+    for &digit in digits.iter().rev() {
+        value = value.checked_mul(10)?.checked_add(u128::from(digit))?;
+    }
+    Some(value)
+}
+
 fn scalar_and_unit(
     value: &Value,
     default_unit: &str,
@@ -417,12 +486,15 @@ fn scalar_and_unit(
             Ok((scalar_text(raw)?, unit.to_owned()))
         }
         Value::String(text) => {
-            let trimmed = text.trim();
+            let trimmed = text.trim_matches(is_written_space);
             for suffix in kind.text_suffixes() {
                 if let Some(prefix) = strip_suffix_ignoring_case(trimmed, suffix)
-                    && !prefix.trim().is_empty()
+                    && !prefix.trim_matches(is_written_space).is_empty()
                 {
-                    return Ok((prefix.trim().to_owned(), (*suffix).to_owned()));
+                    return Ok((
+                        prefix.trim_matches(is_written_space).to_owned(),
+                        (*suffix).to_owned(),
+                    ));
                 }
             }
             Ok((trimmed.to_owned(), default_unit.to_owned()))
@@ -611,6 +683,32 @@ mod tests {
             overflowed_measure(&object, "mm", MeasureKind::Length, CEILING),
             Overflowed::Beyond
         );
+    }
+
+    #[test]
+    fn a_measure_past_i128_on_the_way_is_scaled_exactly_and_rounded_half_even() {
+        // Each numerator passes i128, so only the exact digit path can read it.
+        let tens = |digits: &str| format!("{digits}{}", "0".repeat(39));
+        let read = |text: String| {
+            unbounded_ticks(&Value::String(text), "ticks", MeasureKind::Length)
+                .map(|(_, ticks)| ticks)
+        };
+        for (numerator, denominator, ticks) in [
+            (tens("12"), VAST.to_owned(), 1),
+            (tens("15"), VAST.to_owned(), 2),
+            (tens("17"), VAST.to_owned(), 2),
+            (tens("25"), VAST.to_owned(), 2),
+            (format!("-{}", tens("15")), VAST.to_owned(), -2),
+            (VAST.to_owned(), tens("3"), 3),
+        ] {
+            assert_eq!(
+                read(format!("{numerator}/{denominator}")).unwrap(),
+                ticks,
+                "{numerator}/{denominator}"
+            );
+        }
+        assert!(read(format!("{VAST}/0")).is_err());
+        assert!(read(format!("{VAST}{VAST}")).is_err());
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use super::extreme::{
     ContainerState, PointSet, SCORE_SCALE, apply_candidate, billed_dimensional_weight,
-    container_order_key, find_candidates, ranks_by_volume, score_solution, volume_share_ppm,
+    container_order_key, container_selection_key, decrement, eligible_containers, find_candidates,
+    inventory, ranks_by_volume, score_solution, volume_share_ppm,
 };
 use crate::deadline::Deadline;
 use crate::geometry::ShapeType;
@@ -107,12 +108,35 @@ pub fn pack_exact_one(
     planned.sort_by(|left, right| (&left.0, left.1).cmp(&(&right.0, right.1)));
     let mut best_position = usize::MAX;
 
+    // Past the first container this search continues greedily, one exact search per type per
+    // round. That is worth its cost where nothing else opens a further container: when exact
+    // search is the only solver asked for, and under `lowest_landed_cost`, where a first box
+    // that cannot hold everything may still be the cheaper start. Beside the other
+    // portfolio starts it would only spend the effort budget they already cover.
+    let exact_only = !request.config.solvers.is_empty()
+        && request
+            .config
+            .solvers
+            .iter()
+            .all(|solver| solver == "exact_small");
+    let continues_across_containers = request.config.max_containers.unwrap_or(usize::MAX) > 1
+        && (exact_only || request.config.objective == "lowest_landed_cost");
     for (root_floor, position, initial, can_fit, cannot_fit) in planned {
         if deadline.expired() {
             searched_all_containers = false;
             break;
         }
-        if let Some(best) = best_result.as_ref()
+        // `root_floor` bounds one container of this type. When more containers may open, a
+        // box that cannot hold every item can still complete the order across further
+        // containers, and a floor skip proves nothing against an unpriceable incumbent either
+        //.
+        let single_container_bound_applies = !continues_across_containers
+            || (root_floor[0] == 0
+                && best_result
+                    .as_ref()
+                    .is_some_and(|best| best.score[1] < i128::MAX));
+        if single_container_bound_applies
+            && let Some(best) = best_result.as_ref()
             && (root_floor > best.score || (root_floor == best.score && position > best_position))
         {
             continue;
@@ -123,50 +147,122 @@ pub fn pack_exact_one(
             break;
         }
 
-        let mut best_state = initial.clone();
-        let mut best_state_score = score_state(&best_state, &can_fit, &cannot_fit, &request.config);
-        let complete_lower_bound = root_floor;
-        let mut visited = VisitedStates {
-            keys: StateKeys::new(
-                &profiled,
-                constraints.is_empty()
-                    && scorers.is_empty()
-                    && initial.packed.container.max_stack_density.is_none()
-                    && can_fit.iter().all(|(instance, _)| {
-                        !instance.item.is_stack_sensitive()
-                            && instance.item.shape_type != ShapeType::Compressible
-                    }),
-            ),
-            seen: BTreeSet::new(),
-        };
-        let initial_key = visited.keys.of(&initial);
-        if !deadline.expired()
-            && visited.first_visit(&initial_key)
-            && !deadline.effort_stops(request, &metrics)
-        {
-            search(
-                can_fit,
-                &cannot_fit,
-                request,
-                constraints,
-                scorers,
-                deadline,
-                &initial,
-                initial_key,
-                &mut best_state,
-                &mut best_state_score,
-                &complete_lower_bound,
-                &mut metrics,
-                &mut visited,
-            );
-        }
+        let best_state = search_one_container(
+            &initial,
+            &profiled,
+            can_fit,
+            &cannot_fit,
+            &root_floor,
+            request,
+            constraints,
+            scorers,
+            deadline,
+            &mut metrics,
+        );
 
-        let placed = best_state
+        let mut packed_containers = Vec::new();
+        let mut placed = best_state
             .packed
             .placements
             .iter()
             .map(|placement| placement.instance.id())
             .collect::<BTreeSet<_>>();
+        if !best_state.packed.placements.is_empty() {
+            let first_container_id = best_state.packed.container.id.clone();
+            packed_containers.push(best_state.packed);
+            if continues_across_containers && placed.len() < items.len() {
+                let mut inv = inventory(request);
+                let mut sequences: BTreeMap<String, usize> = request
+                    .containers
+                    .iter()
+                    .map(|container| (container.id.clone(), 0))
+                    .collect();
+                decrement(&mut inv, &first_container_id);
+                sequences.insert(first_container_id, 1);
+                let maximum = request.config.max_containers.unwrap_or(usize::MAX);
+                while placed.len() < items.len()
+                    && packed_containers.len() < maximum
+                    && !deadline.expired()
+                {
+                    let remaining_profiled = profiled
+                        .iter()
+                        .filter(|(item, _)| !placed.contains(&item.id()))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    let remaining_items = remaining_profiled
+                        .iter()
+                        .map(|(item, _)| item.clone())
+                        .collect::<Vec<_>>();
+                    let eligible = eligible_containers(request, &remaining_items, &inv);
+                    if eligible.is_empty() || deadline.effort_stops(request, &metrics) {
+                        break;
+                    }
+                    let mut best_round: Option<(ContainerState, (Vec<i128>, String))> = None;
+                    for container in eligible {
+                        if deadline.expired() || deadline.effort_stops(request, &metrics) {
+                            break;
+                        }
+                        let seq = sequences.get(&container.id).copied().unwrap_or(0) + 1;
+                        let round_initial = ContainerState::new(container, seq);
+                        let (round_fit, round_unfit): (Vec<_>, Vec<_>) =
+                            remaining_profiled.iter().cloned().partition(|(item, _)| {
+                                item_can_fit_container(
+                                    item,
+                                    &round_initial.packed.container,
+                                    &request.config,
+                                )
+                            });
+                        if round_fit.is_empty() {
+                            continue;
+                        }
+                        let round_floor = optimistic_completion_score(
+                            &round_initial,
+                            &round_fit,
+                            &round_unfit,
+                            &request.config,
+                        );
+                        let state = search_one_container(
+                            &round_initial,
+                            &remaining_profiled,
+                            round_fit,
+                            &round_unfit,
+                            &round_floor,
+                            request,
+                            constraints,
+                            scorers,
+                            deadline,
+                            &mut metrics,
+                        );
+                        let round_placed = state.packed.placements.len();
+                        if round_placed == 0 {
+                            continue;
+                        }
+                        let key = container_selection_key(
+                            &state,
+                            remaining_items.len() - round_placed,
+                            remaining_items.len(),
+                            &request.config,
+                        );
+                        if best_round
+                            .as_ref()
+                            .is_none_or(|(_, best_key)| key < *best_key)
+                        {
+                            best_round = Some((state, key));
+                        }
+                    }
+                    let Some((winner, _)) = best_round else {
+                        break;
+                    };
+                    for placement in &winner.packed.placements {
+                        placed.insert(placement.instance.id());
+                    }
+                    let winner_id = winner.packed.container.id.clone();
+                    *sequences.entry(winner_id.clone()).or_default() += 1;
+                    decrement(&mut inv, &winner_id);
+                    packed_containers.push(winner.packed);
+                }
+            }
+        }
         let timed_out = deadline.expired();
         let effort_limited = deadline.effort_stopped();
         let unpacked = items
@@ -193,11 +289,6 @@ pub fn pack_exact_one(
                 UnpackedItem::new(instance, reason, Vec::new())
             })
             .collect::<Vec<_>>();
-        let packed_containers = if best_state.packed.placements.is_empty() {
-            Vec::new()
-        } else {
-            vec![best_state.packed]
-        };
         let score = score_solution(&packed_containers, &unpacked, &request.config);
         let result = PackingResult {
             status: if unpacked.is_empty() {
@@ -240,6 +331,8 @@ pub fn pack_exact_one(
             currency: None,
         };
 
+        // Count first, as in Python: an unpriceable container already scores `i128::MAX` on
+        // the landed key, so a priced answer wins only among answers that place as many.
         let replace = best_result.as_ref().is_none_or(|best| {
             result.score < best.score || (result.score == best.score && position < best_position)
         });
@@ -725,6 +818,58 @@ impl StateKeys {
         }
         key
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn search_one_container(
+    initial: &ContainerState,
+    profiled: &[(ItemInstance, ExactItemProfile)],
+    can_fit: Vec<(ItemInstance, ExactItemProfile)>,
+    cannot_fit: &[(ItemInstance, ExactItemProfile)],
+    root_floor: &[i128],
+    request: &PackingRequest,
+    constraints: &[Arc<dyn PlacementConstraint>],
+    scorers: &[Arc<dyn CandidateScorer>],
+    deadline: &Deadline,
+    metrics: &mut SolverMetrics,
+) -> ContainerState {
+    let mut best_state = initial.clone();
+    let mut best_state_score = score_state(&best_state, &can_fit, cannot_fit, &request.config);
+    let mut visited = VisitedStates {
+        keys: StateKeys::new(
+            profiled,
+            constraints.is_empty()
+                && scorers.is_empty()
+                && initial.packed.container.max_stack_density.is_none()
+                && can_fit.iter().all(|(instance, _)| {
+                    !instance.item.is_stack_sensitive()
+                        && instance.item.shape_type != ShapeType::Compressible
+                }),
+        ),
+        seen: BTreeSet::new(),
+    };
+    let initial_key = visited.keys.of(initial);
+    if !deadline.expired()
+        && visited.first_visit(&initial_key)
+        && !deadline.effort_stops(request, metrics)
+    {
+        search(
+            can_fit,
+            cannot_fit,
+            request,
+            constraints,
+            scorers,
+            deadline,
+            initial,
+            initial_key,
+            &mut best_state,
+            &mut best_state_score,
+            root_floor,
+            metrics,
+            &mut visited,
+        );
+    }
+    best_state
 }
 
 // Each parameter is independently-varying recursive DFS state (the remaining work,
@@ -1367,10 +1512,12 @@ mod tests {
         // `global_deadline_reached` (which requires it) does in every engine; it does not say
         // the clock cut work. Here a search that finished every container keeps `best_found`
         // and the reason it proved, `exact_search_incomplete`, never a `time_limit`.
-        let request = cubes(
+        // One container, so no second crate can take the cubes the first leaves over.
+        let mut request = cubes(
             4,
             serde_json::json!([crate_of("short", "20"), crate_of("long", "30")]),
         );
+        request.config.max_containers = Some(1);
         let finished_late = (2..400)
             .filter_map(|limit_ms| exact(&request, &stepping(limit_ms)))
             .find(|result| {
@@ -1439,5 +1586,110 @@ mod tests {
         let result = exact(&request, &stepping(60_000)).expect("an answer");
         assert_eq!(result.containers[0].placements.len(), 1);
         assert_eq!(result.unpacked.len(), 2);
+    }
+
+    #[test]
+    fn exact_small_packs_two_capped_containers_over_an_unpriceable_bulky_one() {
+        // `bulky` places both cups in one container at an unpriceable
+        // 25 kg dimensional weight, while `capped` takes one cup per box at 300 each.
+        let request = serde_json::json!({
+            "units": {"length": "mm"},
+            "configuration": {
+                "objective": "lowest_landed_cost",
+                "solver_profile": "exact_small",
+                "solvers": ["exact_small"],
+                "dimensional_weight_divisor": 5000,
+                "dimensional_weight_length_unit": "cm",
+                "dimensional_weight_weight_unit": "kg",
+                "time_limit_ms": 300000
+            },
+            "items": [{
+                "id": "cup", "quantity": 2, "weight": "1000 g",
+                "nesting_height": "10",
+                "dimensions": {"length": "100", "width": "100", "height": "50"}
+            }],
+            "containers": [
+                {
+                    "id": "bulky",
+                    "inner_dimensions": {"length": "500", "width": "500", "height": "500"},
+                    "rate_table": {"weight_brackets_g": [1000], "prices_minor": [10]}
+                },
+                {
+                    "id": "capped", "max_payload": "1500 g", "max_items": 1,
+                    "inner_dimensions": {"length": "200", "width": "200", "height": "200"},
+                    "rate_table": {"weight_brackets_g": [3000, 9000], "prices_minor": [300, 200]}
+                }
+            ]
+        });
+        let output = pack_json(&request.to_string()).expect("priceable landed-cost answer");
+        let result: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(result["complete"], true);
+        assert_eq!(result["score"][1], 600);
+        assert_eq!(result["summary"]["container_count"], 2);
+    }
+
+    #[test]
+    fn exact_small_pinned_alone_opens_as_many_containers_as_the_order_needs() {
+        // Pinned on its own, exact search is the only start, so it must open the second box
+        // itself under every objective, as Python's exact solver does inside its driver.
+        for objective in [
+            "default",
+            "lowest_cost",
+            "open_dimension_height",
+            "maximum_volume",
+        ] {
+            let request = serde_json::json!({
+                "units": {"length": "mm"},
+                "configuration": {"objective": objective, "solvers": ["exact_small"],
+                                  "time_limit_ms": 300000},
+                "items": [{"id": "brick", "quantity": 2, "weight": "1000 g",
+                           "dimensions": {"length": "100", "width": "100", "height": "100"}}],
+                "containers": [{"id": "unit", "cost_minor": 5,
+                                "inner_dimensions": {"length": "100", "width": "100", "height": "100"}}]
+            });
+            let output = pack_json(&request.to_string()).expect("a two-container answer");
+            let result: serde_json::Value = serde_json::from_str(&output).unwrap();
+            assert_eq!(result["complete"], true, "{objective}");
+            assert_eq!(result["summary"]["container_count"], 2, "{objective}");
+        }
+    }
+
+    #[test]
+    fn exact_small_opens_two_cheap_brackets_instead_of_one_dear_container() {
+        // Two 1000 g bricks cannot share a 1500 g bracket in one box,
+        // so opening two `unit-cheap` boxes pays 200 against 5000 in `snug-dear`.
+        let request = serde_json::json!({
+            "units": {"length": "mm"},
+            "configuration": {
+                "objective": "lowest_landed_cost",
+                "solver_profile": "exact_small",
+                "solvers": ["exact_small"],
+                "dimensional_weight_divisor": 5000,
+                "dimensional_weight_length_unit": "cm",
+                "dimensional_weight_weight_unit": "kg",
+                "time_limit_ms": 300000
+            },
+            "items": [{
+                "id": "brick", "quantity": 2, "weight": "1000 g",
+                "dimensions": {"length": "100", "width": "100", "height": "100"}
+            }],
+            "containers": [
+                {
+                    "id": "snug-dear",
+                    "inner_dimensions": {"length": "200", "width": "100", "height": "100"},
+                    "rate_table": {"weight_brackets_g": [20000], "prices_minor": [5000]}
+                },
+                {
+                    "id": "unit-cheap",
+                    "inner_dimensions": {"length": "100", "width": "100", "height": "100"},
+                    "rate_table": {"weight_brackets_g": [1500], "prices_minor": [100]}
+                }
+            ]
+        });
+        let output = pack_json(&request.to_string()).expect("two-container landed answer");
+        let result: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(result["complete"], true);
+        assert_eq!(result["score"][1], 200);
+        assert_eq!(result["summary"]["container_count"], 2);
     }
 }

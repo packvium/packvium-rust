@@ -2,7 +2,7 @@
   "document": {
     "policy_rules": [
       {"rule_id": "a-minimum", "versions": [{
-        "scope": "facility", "action": "reject", "priority": -9223372036854775808,
+        "scope": "facility", "action": "reject", "priority": -9007199254740991,
         "effective_at": 0,
         "predicates": [{"scope": "facility", "field": "x", "operator": "exists"}]
       }]},
